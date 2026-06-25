@@ -5306,9 +5306,12 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
 
    //--- DIRECTION / TRIGGER (fresh Return preferred; ownership-death fallback) ---
    double domNow=0.0;
-   if(cur_mtfEntryFresh && cur_mtfEntryDir!=0){ dir=cur_mtfEntryDir; domNow=cur_mtfEntryDom; }
-   else if(InpAllowDeathTrigger){ int _dd=DesiredDirection(); if(_dd!=0){ dir=_dd; domNow=cur_domTransfer; } }
-   if(dir==0){ reason="no entry trigger (no fresh Return / no ownership-death signal)"; return(false); }
+   if(cur_mtfEntryFresh && cur_mtfEntryDir!=0){ dir=cur_mtfEntryDir; domNow=cur_mtfEntryDom; }   // entry-cycle event
+   else if(InpAllowDeathTrigger && cur_ownerDeathSignals>=2){                                   // ownership-death fallback (the proven trigger)
+      int _macD=(cur_dirH4!=0)?cur_dirH4:((cur_dirH1!=0)?cur_dirH1:0);
+      if(_macD!=0){ dir=-_macD; domNow=fmax2(cur_domTransfer,(double)cur_ownerDeathSignals*30.0); }  // dying macro -> oppose it
+   }
+   if(dir==0){ reason="no entry trigger (no fresh Return / ownerDeath<2 or macro dir flat)"; return(false); }
 
    // ================= HARD SPEC GATES =================
    //--- 1) Ownership / dominance transfer: first strike vs entry cycle ---
@@ -5427,6 +5430,14 @@ void TryEnter()
    //  (b) the belief/_entryReadyGate -> arrow/MTF/FU/aggressive tangle.
    // ================================================================
    if(!InpUseSpecEngine){ gEntryBlock="spec engine off"; return; }
+   if(InpDebugEntries){   // v13.6 heartbeat: shows trigger inputs once per bar
+      static datetime _hbBar=0; datetime _bt=iTime(_Symbol,_Period,0);
+      if(_bt!=_hbBar){ _hbBar=_bt;
+         PrintFormat("HB death=%d dirH4=%d dirH1=%d fresh=%s mtfDir=%d domXfer=%.0f budget=%.0f distFlip=%.1f ready=%s trans=%s",
+            cur_ownerDeathSignals,cur_dirH4,cur_dirH1,(cur_mtfEntryFresh?"Y":"n"),cur_mtfEntryDir,
+            cur_domTransfer,cur_curveBudget,cur_distFlipAtr,cur_entryReady,cur_transState);
+      }
+   }
 
    int dir=0; double execProb=0.0; string why="";
    bool go=SpecEntryDecision(dir,execProb,why);
