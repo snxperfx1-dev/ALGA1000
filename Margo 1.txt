@@ -4742,6 +4742,121 @@ void meUpdatePhase()
 //==================================================================
 // UMBRELLA UPDATE  (called once per new bar, after ComputeEngine)
 //==================================================================
+//  v13.1 REFINEMENT ENGINES  (from masterclass transcripts 3 & 4)
+//==================================================================
+//  Additive to E1-E8. Outputs only; decisions stay in SpecEntryDecision.
+//   E9  Round-number / psychological inducement levels
+//   E10 Liquidity DENSITY (touch-count) target strength
+//   E2+ Timing windows (low/high-of-day, Frankfurt raid side)
+//   E11 Multi-TF POI refinement cascade (tighter SL)
+//   + counter-trend Asia hard-TP cap (management, in TryEnter)
+//==================================================================
+input group "Letra37 EA - v13.1 Refinements"
+input bool   InpUseRoundLevels    = true;   // E9: psychological round-number inducement levels
+input double InpRoundStep         = 0.0;    // E9: round step (0 = auto: 10.0 for gold-class, else 50-pip)
+input double InpRoundProxAtr      = 0.6;    // E9: proximity (xATR) to count as 'reacting at' a round level
+input bool   InpUseTimingWindows  = true;   // E2+: low/high-of-day timing-window confidence
+input int    InpLodStartHour      = 12;     // E2+: low/high-of-day window START (broker server time)
+input int    InpLodEndHour        = 18;     // E2+: low/high-of-day window END (server time)
+input bool   InpUsePOICascade     = true;   // E11: multi-TF POI refinement -> tighter SL (last opposite candle)
+input double InpCounterTrendAsiaTP= 0.0;    // mgmt: hard TP (PRICE units, e.g. 4.0=40 gold pips) for counter-trend Asia trades (0=off)
+
+//------------------------- outputs --------------------------------
+double me_roundAbove=DBL_MAX, me_roundBelow=DBL_MAX;     // E9
+bool   me_inLodWindow=false, me_inAsiaNow=false;         // E2+
+int    me_frankfurtRaidSide=0;                           // E2+ (+1 expect high raided, -1 expect low raided)
+
+//==================================================================
+// E9  ROUND-NUMBER / PSYCHOLOGICAL LEVELS
+//==================================================================
+double meRoundStep()
+{
+   if(InpRoundStep>0) return(InpRoundStep);
+   return(_Digits<=3 ? 10.0 : 0.00500);    // gold-class vs 5-digit FX (~50 pip)
+}
+void meUpdateRoundLevels()
+{
+   double px=iClose(_Symbol,_Period,1); if(px<=0) return;
+   double step=meRoundStep(); if(step<=0) return;
+   me_roundBelow=MathFloor(px/step)*step;
+   me_roundAbove=MathCeil (px/step)*step;
+}
+double meRoundConf(const int dir)
+{
+   if(!InpUseRoundLevels || naf(me_roundBelow) || naf(me_roundAbove)) return(70.0);
+   double atr=cur_atr>0?cur_atr:10*_Point; double prox=InpRoundProxAtr*atr;
+   double px=iClose(_Symbol,_Period,1);
+   // a buy that has reclaimed just above a round level (retail trapped below) is prime; mirror for sells
+   if(dir==1  && (px-me_roundBelow)>=0 && (px-me_roundBelow)<=prox) return(90.0);
+   if(dir==-1 && (me_roundAbove-px)>=0 && (me_roundAbove-px)<=prox) return(90.0);
+   return(70.0);
+}
+
+//==================================================================
+// E10  LIQUIDITY DENSITY  (touch-count of the target pool = resting liquidity)
+//==================================================================
+double meTargetDensityConf(const int dir)
+{
+   if(!InpUseLiquidityEngine) return(100.0);
+   double tgt=(dir==1)?me_liqTargetAbove:me_liqTargetBelow;
+   if(naf(tgt)) return(50.0);
+   double atr=cur_atr>0?cur_atr:10*_Point; double tol=atr*InpEqTolAtr; int cnt=1;
+   if(dir==1){ for(int i=0;i<me_poolHiN;i++) if(MathAbs(me_poolHi[i]-tgt)<=tol){ cnt=me_poolHiCnt[i]; break; } }
+   else      { for(int i=0;i<me_poolLoN;i++) if(MathAbs(me_poolLo[i]-tgt)<=tol){ cnt=me_poolLoCnt[i]; break; } }
+   return(cnt>=3?100.0:cnt==2?80.0:60.0);
+}
+
+//==================================================================
+// E2+  TIMING WINDOWS  (low/high-of-day, Frankfurt raid side)
+//==================================================================
+void meUpdateDailyEnrich()
+{
+   MqlDateTime now; TimeToStruct(TimeCurrent(),now);
+   me_inLodWindow=(InpLodStartHour<=InpLodEndHour)?(now.hour>=InpLodStartHour && now.hour<InpLodEndHour)
+                                                   :(now.hour>=InpLodStartHour || now.hour<InpLodEndHour);
+   me_inAsiaNow=(InpAsiaStartHour<=InpAsiaEndHour)?(now.hour>=InpAsiaStartHour && now.hour<InpAsiaEndHour)
+                                                  :(now.hour>=InpAsiaStartHour || now.hour<InpAsiaEndHour);
+   // a bullish day prints the low first -> Frankfurt is expected to RAID THE LOW (so we can buy)
+   me_frankfurtRaidSide=(me_dailyBias>0)?-1:(me_dailyBias<0?1:0);
+}
+double meTimingWindowConf(const int dir)
+{
+   if(!InpUseTimingWindows) return(100.0);
+   double c=60.0;
+   if(me_inLodWindow){ c=((dir==1&&me_dailyBias==1)||(dir==-1&&me_dailyBias==-1))?100.0:78.0; }
+   // align with the expected Frankfurt raid (buy after low raided / sell after high raided)
+   if((dir==1&&me_frankfurtRaidSide==-1)||(dir==-1&&me_frankfurtRaidSide==1)) c=clamp(c+10.0,0,100);
+   return(c);
+}
+
+//==================================================================
+// E11  MULTI-TF POI REFINEMENT CASCADE  (last opposite candle -> tighter SL)
+//==================================================================
+double meLastOppCandleSL(const ENUM_TIMEFRAMES tf,const int dir,const double entry)
+{
+   for(int s=1;s<=40;s++){
+      double o=iOpen(_Symbol,tf,s),c=iClose(_Symbol,tf,s),h=iHigh(_Symbol,tf,s),l=iLow(_Symbol,tf,s);
+      if(o<=0) continue;
+      if(dir==1  && c<o && l<entry) return(l);     // last bearish candle below entry = demand origin
+      if(dir==-1 && c>o && h>entry) return(h);     // last bullish candle above entry = supply origin
+   }
+   return(NA);
+}
+double meRefinePOICascade(const int dir,const double entry)
+{
+   if(!InpUsePOICascade) return(NA);
+   double atr=cur_atr>0?cur_atr:10*_Point; double best=NA;
+   ENUM_TIMEFRAMES tfs[3]; tfs[0]=PERIOD_M15; tfs[1]=PERIOD_M5; tfs[2]=PERIOD_M2;  // coarse->fine; finest valid wins
+   for(int i=0;i<3;i++){
+      double sl=meLastOppCandleSL(tfs[i],dir,entry); if(naf(sl)) continue;
+      double dist=(dir==1)?(entry-sl):(sl-entry);
+      if(dist>=atr*0.15 && dist<=atr*3.0) best=sl;
+   }
+   return(best);
+}
+
+
+//==================================================================
 void UpdateMethodologyEngines()
 {
    if(InpUseTimeEngine || InpUseLiquidityEngine) meUpdateDailyCycle();   // Asia range feeds E1
@@ -4751,6 +4866,8 @@ void UpdateMethodologyEngines()
    if(InpUseBreakEngine)     meUpdateBreak();
    if(InpUseCrossAsset)      meUpdateCross();
    if(InpUsePrecisionEngine) meUpdatePrecision();
+   if(InpUseRoundLevels)   meUpdateRoundLevels();
+   if(InpUseTimingWindows) meUpdateDailyEnrich();
    meUpdatePhase();                                                      // output label, always
 }
 
@@ -4817,6 +4934,10 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
 
    //--- methodology engine factors ---
    double liqC=100,timeC=100,regC=100,cycC=100,brkC=100,xC=100,prcC=100;
+   double rndC=100,twC=100,densC=100;   // v13.1
+   if(InpUseRoundLevels)     rndC=meRoundConf(dir);
+   if(InpUseTimingWindows)   twC =meTimingWindowConf(dir);
+   if(InpUseLiquidityEngine) densC=meTargetDensityConf(dir);
    if(InpUseLiquidityEngine) liqC=meLiquidityConf(dir);
    if(InpUseTimeEngine)      timeC=meTimeConf(dir);
    if(InpUseRegimeEngine)    regC=meRegimeConf(dir);
@@ -4835,6 +4956,9 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    if(InpUseBreakEngine)     meAddF(brkC,logsum,cnt);
    if(InpUseCrossAsset)      meAddF(xC,logsum,cnt);
    if(InpUsePrecisionEngine) meAddF(prcC,logsum,cnt);
+   if(InpUseRoundLevels)     meAddF(rndC,logsum,cnt);
+   if(InpUseTimingWindows)   meAddF(twC,logsum,cnt);
+   if(InpUseLiquidityEngine) meAddF(densC,logsum,cnt);
 
    execProb=(cnt>0)?100.0*MathExp(logsum/(double)cnt):0.0;
 
@@ -4843,7 +4967,8 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
                " rec"+IntegerToString((int)recursionConf)+" liq"+IntegerToString((int)liqC)+
                " tim"+IntegerToString((int)timeC)+" reg"+IntegerToString((int)regC)+
                " cyc"+IntegerToString((int)cycC)+" brk"+IntegerToString((int)brkC)+
-               " x"+IntegerToString((int)xC)+" prc"+IntegerToString((int)prcC)+"]";
+               " x"+IntegerToString((int)xC)+" prc"+IntegerToString((int)prcC)+
+               " rnd"+IntegerToString((int)rndC)+" tw"+IntegerToString((int)twC)+" den"+IntegerToString((int)densC)+"]";
    if(execProb<InpExecProbMin){
       reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+diag; return(false);
    }
@@ -4917,8 +5042,21 @@ void TryEnter()
       if(dir==1  && me_refinedSL<entry && me_refinedSL>slBase && (entry-me_refinedSL)>=_atrP*0.2) slBase=me_refinedSL;
       if(dir==-1 && me_refinedSL>entry && me_refinedSL<slBase && (me_refinedSL-entry)>=_atrP*0.2) slBase=me_refinedSL;
    }
+   //--- E11 POI CASCADE: tighten SL to the finest-TF last-opposite-candle origin when valid ---
+   if(InpUsePOICascade){
+      double _slC=meRefinePOICascade(dir,entry);
+      if(!naf(_slC)){
+         if(dir==1  && _slC<entry && _slC>slBase) slBase=_slC;
+         if(dir==-1 && _slC>entry && _slC<slBase) slBase=_slC;
+      }
+   }
    double lot=CalcLot(entry,slBase);
    double tp=ComputeTP(dir,entry,slBase);                        // 0 -> owner-driven exits manage the trade
+   //--- mgmt: counter-trend Asia trades get a hard TP cap (Asia range is small; you may be asleep) ---
+   if(InpCounterTrendAsiaTP>0.0 && me_inAsiaNow && me_externalDir!=0 && dir!=me_externalDir){
+      double _ctp=(dir==1)?entry+InpCounterTrendAsiaTP:entry-InpCounterTrendAsiaTP;
+      if(tp<=0.0 || (dir==1 && _ctp<tp) || (dir==-1 && _ctp>tp)) tp=_ctp;
+   }
    if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
    if(InpSmallAccount && InpSmallAcctMaxRiskPct>0.0){
       double _riskMoney=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
