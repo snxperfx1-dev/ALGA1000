@@ -3765,7 +3765,7 @@ input bool   InpFUExtremeEntry  = true;    // Enter AT the fresh FU node (the in
 input bool   InpFURequireBias   = true;    // FU: only take a node that AGREES with the dominant bias (DOE+network+wave) - stops fading reversals
 input bool   InpMultiTFEntry    = true;    // MULTI-TF: enter on a fresh Demand/Supply Return on ANY rung (M1/M3/M5/M15/H1/H4)
 input int    InpMinEntryRung     = 1;      // Lowest rung allowed for a multi-TF entry (1=M1 ... 6=H4)
-input double InpMinDomTransfer   = 45.0;   // Min dominance-transfer % to treat a Return as an ENTRY CYCLE (below = first strike, wait)
+input double InpMinDomTransfer   = 35.0;   // Min dominance-transfer % to treat a Return as an ENTRY CYCLE (below = first strike, wait)
 input double InpMinEntryProb     = 0.0;    // Optional: min entry-cycle probability % to allow a multi-TF entry (0 = off)
 input bool   InpRequireAtFlip    = false;  // Optional: only take multi-TF entries when price is AT the HTF FU flip zone (terminal side)
 input int    InpMinTermShifts    = 3;      // F72: require N terminal shifts (Wyckoff ~4, min 3) before entry; failure-swing / Extreme compression bypasses (fire fast)
@@ -4387,10 +4387,14 @@ bool SymphonyTrigger(const int dir)
 //         failure swing)? compression controls recursion count.
 //==================================================================
 input bool   InpUseSpecEngine   = true;   // v13: use the new spec curve-ownership entry engine (replaces legacy death + belief paths)
-input double InpExecProbMin      = 70.0;  // v13: min executionProbability (geometric mean of the 5 spec engines, 0..100) to fire
-input bool   InpSpecRequireFlip  = true;  // v13: require price at the HTF flip terminal (the curve-alive zone) to enter
+input double InpExecProbMin      = 55.0;  // v13: min executionProbability (geometric mean of the 5 spec engines, 0..100) to fire
+input bool   InpSpecRequireFlip  = false;  // v13: require price at the HTF flip terminal (the curve-alive zone) to enter
 input double InpSpecFlipAtr       = 1.5;  // v13: max ATR distance to the flip terminal when the context flip flag is unavailable
 input double InpSpecMinBudget     = 20.0; // v13: min owner-driven destination room (curve budget %) to justify an entry
+input double InpFactorFloor       = 25.0;  // v13.5: per-factor floor (prevents ONE low factor tanking execProb)
+input bool   InpAllowDeathTrigger = true;  // v13.5: allow ownership-death direction as a trigger when no fresh Return
+input bool   InpTimeHardGate      = false; // v13.5: make the pre-liquidation time gate HARD (else soft factor only)
+input bool   InpRegimeHardGate    = false; // v13.5: make the counter-trend regime gate HARD (else soft factor only)
 
 //==================================================================
 //  v13 METHODOLOGY ENGINES  (8 engines from the masterclass transcripts)
@@ -5290,7 +5294,7 @@ void UpdateMethodologyEngines()
 //--- accumulate a confidence factor (0..100) into a geometric-mean product ---
 void meAddF(const double conf,double &logsum,int &cnt)
 {
-   double c=clamp(conf,1.0,100.0)/100.0;   // floor avoids log(0)
+   double c=clamp(conf,InpFactorFloor,100.0)/100.0;   // v13.5: higher floor so one weak factor cannot zero execProb
    logsum+=MathLog(c); cnt++;
 }
 
@@ -5300,14 +5304,16 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
 {
    dir=0; execProb=0.0; reason="";
 
-   //--- DIRECTION: a fresh Demand/Supply Return on the OWNING curve = the entry-cycle event ---
-   if(!cur_mtfEntryFresh || cur_mtfEntryDir==0){ reason="no entry-cycle event (awaiting fresh Return on owning curve)"; return(false); }
-   dir=cur_mtfEntryDir;
+   //--- DIRECTION / TRIGGER (fresh Return preferred; ownership-death fallback) ---
+   double domNow=0.0;
+   if(cur_mtfEntryFresh && cur_mtfEntryDir!=0){ dir=cur_mtfEntryDir; domNow=cur_mtfEntryDom; }
+   else if(InpAllowDeathTrigger){ int _dd=DesiredDirection(); if(_dd!=0){ dir=_dd; domNow=cur_domTransfer; } }
+   if(dir==0){ reason="no entry trigger (no fresh Return / no ownership-death signal)"; return(false); }
 
    // ================= HARD SPEC GATES =================
    //--- 1) Ownership / dominance transfer: first strike vs entry cycle ---
-   if(cur_mtfEntryDom < InpMinDomTransfer){
-      reason="FIRST STRIKE on "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < "+IntegerToString((int)InpMinDomTransfer)+"%) -- building, not executing";
+   if(domNow < InpMinDomTransfer){
+      reason="FIRST STRIKE (dom "+IntegerToString((int)domNow)+"% < "+IntegerToString((int)InpMinDomTransfer)+"%) -- building, not executing";
       return(false);
    }
    //--- v13.4 FU candle HARD gate (optional) ---
@@ -5324,11 +5330,11 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
       reason="no destination room (budget "+IntegerToString((int)cur_curveBudget)+"% < "+IntegerToString((int)InpSpecMinBudget)+"%)"; return(false);
    }
    //--- E2 TIME gate: don't hunt entries before one side of Asia is swept (anti pre-liquidation chop) ---
-   if(InpUseTimeEngine && !me_timeGateOK){
+   if(InpUseTimeEngine && InpTimeHardGate && !me_timeGateOK){
       reason="PRE-LIQUIDATION window (Asia range building / no sweep yet) -- wait for the liquidation"; return(false);
    }
    //--- E3 REGIME gate: block internal counter-trend traps inside one HTF impulse ---
-   if(InpUseRegimeEngine && me_regimeContained && dir!=me_governingDir){
+   if(InpUseRegimeEngine && InpRegimeHardGate && me_regimeContained && dir!=me_governingDir){
       reason="COUNTER-TREND trap: internal "+(dir==1?"buy":"sell")+" inside HTF "+(me_governingDir==1?"bull":"bear")+" impulse (price targets HTF origin)"; return(false);
    }
    //--- E1 LIQUIDITY room gate (optional hard) ---
@@ -5339,7 +5345,7 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
 
    // ================= CONTINUOUS FACTORS (geometric mean) =================
    //--- original 5 spec factors ---
-   double ownershipConf =clamp(cur_mtfEntryDom,0,100);
+   double ownershipConf =clamp(domNow,0,100);
    double maturityConf  =clamp(cur_transMaturity,0,100);
    double geometryConf  =atFlip?100.0:clamp(100.0*(1.0-dFlip/3.0),0,100);
    double destinationConf=clamp(cur_curveBudget,0,100);
@@ -5425,7 +5431,8 @@ void TryEnter()
    int dir=0; double execProb=0.0; string why="";
    bool go=SpecEntryDecision(dir,execProb,why);
    gEntryBlock=why;
-   if(!go || dir==0) return;
+   if(!go){ if(InpDebugEntries && dir!=0) Print("=== NO-ENTRY ",(dir==1?"BUY":"SELL"),"  ",why); return; }
+   if(dir==0) return;
 
    //--- direction enable / invalidation ---
    if(dir==1  && !InpTradeLongs){  gEntryBlock="longs off";  return; }
