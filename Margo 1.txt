@@ -4857,6 +4857,132 @@ double meRefinePOICascade(const int dir,const double entry)
 
 
 //==================================================================
+//  v13.2 ENGINES  (from masterclass transcripts 5 & 6)
+//==================================================================
+//  Additive; outputs only. Fold into executionProbability.
+//   E12 Wyckoff + VOLUME (climax / spring / volume-confirmed break)
+//   E13 Drive exhaustion (~5-6 drives into an extreme -> reversal)
+//   E14 Quasimodo / CHoCH-retrace level (QML entry)
+//   E15 Premium / Discount / OTE (buy discount, sell premium, avoid mid)
+//==================================================================
+input group "Letra37 EA - v13.2 Engines"
+input bool   InpUseWyckoff         = true;   // E12: volume climax / spring / volume-confirmed break
+input double InpVolSpikeMult       = 1.8;    // E12: tick-volume spike threshold (x avg) = climax
+input bool   InpUseExhaustion      = true;   // E13: N-drive exhaustion into an extreme
+input int    InpDriveExhaust       = 5;      // E13: drives into an extreme that flag exhaustion
+input bool   InpUseQM              = true;   // E14: Quasimodo / CHoCH-retrace level
+input bool   InpUsePremiumDiscount = true;   // E15: premium/discount/OTE leg positioning
+input int    InpPDLookback         = 120;    // E15: bars (working TF) for the leg range
+
+//------------------------- outputs --------------------------------
+double me_volAvg=0, me_volLast=0; bool me_volSpike=false;      // E12
+int    me_springDir=0, me_volConfDir=0;
+int    me_driveCount=0, me_driveDir=0; bool me_exhausted=false; // E13
+int    me_qmDir=0; double me_qmLevel=DBL_MAX;                   // E14
+double me_legHigh=DBL_MAX, me_legLow=DBL_MAX, me_pdPct=50.0;    // E15
+bool   me_inDiscount=false, me_inPremium=false, me_inManipMid=false;
+
+//==================================================================
+// E12  WYCKOFF + VOLUME
+//==================================================================
+void meUpdateWyckoff()
+{
+   ENUM_TIMEFRAMES tf=_Period; long sum=0; int n=0;
+   for(int s=2;s<=21;s++){ long v=iVolume(_Symbol,tf,s); if(v>0){ sum+=v; n++; } }
+   me_volAvg=(n>0)?(double)sum/(double)n:0.0;
+   me_volLast=(double)iVolume(_Symbol,tf,1);
+   me_volSpike=(me_volAvg>0 && me_volLast>me_volAvg*InpVolSpikeMult);
+   // spring (bullish: swept low reclaimed) / UTAD (bearish: swept high rejected) -- reuse E1 sweeps
+   me_springDir=0;
+   if(!naf(me_lastSweptLow))      me_springDir=1;
+   else if(!naf(me_lastSweptHigh)) me_springDir=-1;
+   // volume-confirmed break uses E6 break direction
+   me_volConfDir=(me_breakDir!=0 && me_volSpike)?me_breakDir:0;
+}
+double meWyckoffConf(const int dir)
+{
+   if(!InpUseWyckoff) return(100.0);
+   double c=60.0;
+   if(me_springDir==dir) c+=25.0;            // spring/UTAD aligns with our side
+   if(me_volConfDir==dir) c+=15.0;           // climax volume confirms our direction
+   else if(me_volConfDir==-dir) c-=15.0;
+   return(clamp(c,0,100));
+}
+
+//==================================================================
+// E13  DRIVE EXHAUSTION
+//==================================================================
+void meUpdateDrives()
+{
+   ENUM_TIMEFRAMES tf=_Period; int k=2;
+   double lastH=NA; int upc=0; double lastL=NA; int dnc=0;
+   // scanning recent->older: an UP-leg into a high has progressively LOWER swing highs going back
+   for(int s=k+1;s<=200;s++){
+      if(meIsSwingHigh(tf,s,k)){ double h=iHigh(_Symbol,tf,s);
+         if(naf(lastH)){ lastH=h; upc=1; } else { if(h<lastH){ upc++; lastH=h; } else break; } }
+   }
+   for(int s=k+1;s<=200;s++){
+      if(meIsSwingLow(tf,s,k)){ double l=iLow(_Symbol,tf,s);
+         if(naf(lastL)){ lastL=l; dnc=1; } else { if(l>lastL){ dnc++; lastL=l; } else break; } }
+   }
+   if(upc>=dnc){ me_driveDir=1; me_driveCount=upc; } else { me_driveDir=-1; me_driveCount=dnc; }
+   me_exhausted=(me_driveCount>=InpDriveExhaust);
+}
+double meExhaustionConf(const int dir)
+{
+   if(!InpUseExhaustion || !me_exhausted) return(70.0);
+   if(me_driveDir==1)  return(dir==-1?100.0:35.0);   // exhausted up-leg -> favours sells
+   if(me_driveDir==-1) return(dir==1?100.0:35.0);    // exhausted down-leg -> favours buys
+   return(70.0);
+}
+
+//==================================================================
+// E14  QUASIMODO / CHoCH-RETRACE LEVEL
+//==================================================================
+void meUpdateQM()
+{
+   ENUM_TIMEFRAMES tf=_Period; me_qmDir=0; me_qmLevel=NA;
+   for(int s=1;s<=60;s++){
+      double level=NA,levelL=NA;
+      for(int j=s+1;j<=s+15;j++){ if(meIsSwingHigh(tf,j,2)){ level=iHigh(_Symbol,tf,j); break; } }
+      for(int j=s+1;j<=s+15;j++){ if(meIsSwingLow(tf,j,2)){ levelL=iLow(_Symbol,tf,j); break; } }
+      double c=iClose(_Symbol,tf,s);
+      if(!naf(level) && c>level){ me_qmDir=1; me_qmLevel=level; break; }    // CHoCH up: broken high = QML
+      if(!naf(levelL) && c<levelL){ me_qmDir=-1; me_qmLevel=levelL; break; } // CHoCH down
+   }
+}
+double meQMConf(const int dir)
+{
+   if(!InpUseQM || me_qmDir==0 || naf(me_qmLevel)) return(70.0);
+   if(me_qmDir!=dir) return(45.0);
+   double atr=cur_atr>0?cur_atr:10*_Point; double px=iClose(_Symbol,_Period,1);
+   double d=MathAbs(px-me_qmLevel)/atr;
+   return(d<1.0?100.0:d<2.5?80.0:60.0);    // near the QML retrace = prime
+}
+
+//==================================================================
+// E15  PREMIUM / DISCOUNT / OTE
+//==================================================================
+void meUpdatePD()
+{
+   ENUM_TIMEFRAMES tf=_Period; double hi=-DBL_MAX,lo=DBL_MAX;
+   for(int s=1;s<=InpPDLookback;s++){ double H=iHigh(_Symbol,tf,s),L=iLow(_Symbol,tf,s); if(H>hi)hi=H; if(L>0&&L<lo)lo=L; }
+   me_legHigh=hi; me_legLow=lo;
+   double px=iClose(_Symbol,tf,1);
+   me_pdPct=(hi>lo)?100.0*(px-lo)/(hi-lo):50.0;
+   me_inDiscount=(me_pdPct<38.2);
+   me_inPremium =(me_pdPct>61.8);
+   me_inManipMid=(me_pdPct>=50.0 && me_pdPct<=79.0);   // 50-70.5/79 = inducement / OTE manipulation band
+}
+double mePDConf(const int dir)
+{
+   if(!InpUsePremiumDiscount) return(100.0);
+   if(dir==1){ if(me_inDiscount) return(100.0); if(me_inPremium) return(40.0); return(65.0); }
+   else      { if(me_inPremium)  return(100.0); if(me_inDiscount) return(40.0); return(65.0); }
+}
+
+
+//==================================================================
 void UpdateMethodologyEngines()
 {
    if(InpUseTimeEngine || InpUseLiquidityEngine) meUpdateDailyCycle();   // Asia range feeds E1
@@ -4868,6 +4994,10 @@ void UpdateMethodologyEngines()
    if(InpUsePrecisionEngine) meUpdatePrecision();
    if(InpUseRoundLevels)   meUpdateRoundLevels();
    if(InpUseTimingWindows) meUpdateDailyEnrich();
+   if(InpUseWyckoff)         meUpdateWyckoff();
+   if(InpUseExhaustion)      meUpdateDrives();
+   if(InpUseQM)              meUpdateQM();
+   if(InpUsePremiumDiscount) meUpdatePD();
    meUpdatePhase();                                                      // output label, always
 }
 
@@ -4935,6 +5065,11 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    //--- methodology engine factors ---
    double liqC=100,timeC=100,regC=100,cycC=100,brkC=100,xC=100,prcC=100;
    double rndC=100,twC=100,densC=100;   // v13.1
+   double wycC=100,exhC=100,qmC=100,pdC=100;   // v13.2
+   if(InpUseWyckoff)         wycC=meWyckoffConf(dir);
+   if(InpUseExhaustion)      exhC=meExhaustionConf(dir);
+   if(InpUseQM)              qmC =meQMConf(dir);
+   if(InpUsePremiumDiscount) pdC =mePDConf(dir);
    if(InpUseRoundLevels)     rndC=meRoundConf(dir);
    if(InpUseTimingWindows)   twC =meTimingWindowConf(dir);
    if(InpUseLiquidityEngine) densC=meTargetDensityConf(dir);
@@ -4959,6 +5094,10 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    if(InpUseRoundLevels)     meAddF(rndC,logsum,cnt);
    if(InpUseTimingWindows)   meAddF(twC,logsum,cnt);
    if(InpUseLiquidityEngine) meAddF(densC,logsum,cnt);
+   if(InpUseWyckoff)         meAddF(wycC,logsum,cnt);
+   if(InpUseExhaustion)      meAddF(exhC,logsum,cnt);
+   if(InpUseQM)              meAddF(qmC,logsum,cnt);
+   if(InpUsePremiumDiscount) meAddF(pdC,logsum,cnt);
 
    execProb=(cnt>0)?100.0*MathExp(logsum/(double)cnt):0.0;
 
@@ -4968,7 +5107,8 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
                " tim"+IntegerToString((int)timeC)+" reg"+IntegerToString((int)regC)+
                " cyc"+IntegerToString((int)cycC)+" brk"+IntegerToString((int)brkC)+
                " x"+IntegerToString((int)xC)+" prc"+IntegerToString((int)prcC)+
-               " rnd"+IntegerToString((int)rndC)+" tw"+IntegerToString((int)twC)+" den"+IntegerToString((int)densC)+"]";
+               " rnd"+IntegerToString((int)rndC)+" tw"+IntegerToString((int)twC)+" den"+IntegerToString((int)densC)+
+               " wyc"+IntegerToString((int)wycC)+" exh"+IntegerToString((int)exhC)+" qm"+IntegerToString((int)qmC)+" pd"+IntegerToString((int)pdC)+"]";
    if(execProb<InpExecProbMin){
       reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+diag; return(false);
    }
