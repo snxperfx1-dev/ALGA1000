@@ -4392,75 +4392,463 @@ input bool   InpSpecRequireFlip  = true;  // v13: require price at the HTF flip 
 input double InpSpecFlipAtr       = 1.5;  // v13: max ATR distance to the flip terminal when the context flip flag is unavailable
 input double InpSpecMinBudget     = 20.0; // v13: min owner-driven destination room (curve budget %) to justify an entry
 
+//==================================================================
+//  v13 METHODOLOGY ENGINES  (8 engines from the masterclass transcripts)
+//==================================================================
+//  These engines ONLY PRODUCE continuous outputs. All execution logic
+//  stays in SpecEntryDecision. Phases remain OUTPUT-ONLY (v11/v12 law).
+//  Every engine has a master toggle for A/B testing.
+//
+//   E1 Liquidity      : equal H/L, trendline, PDH/PDL/PWH/PWL, session pools
+//   E2 Daily-Cycle    : Asia range, 12->1 one-side liquidation, low/high-of-day timing
+//   E3 Regime         : external-vs-internal + HTF one-impulse containment
+//   E4 Higher-cycle   : weekly/monthly tail-then-body bias
+//   E5 Precision      : refine entry/SL to the last-liquidity-grab origin
+//   E6 Break quality  : wick-through vs momentum-body classifier
+//   E7 Cross-asset    : DXY/EURUSD/correlated directional confluence
+//   E8 Phase 1-5      : cyclical labels (OUTPUT ONLY)
+//==================================================================
+input group "Letra37 EA - v13 Methodology Engines"
+input bool   InpUseLiquidityEngine = true;   // E1: liquidity pools as targets + POI validation
+input double InpEqTolAtr          = 0.12;    // E1: tolerance (xATR) for two swings = one equal-H/L pool
+input int    InpLiqSwingLookback  = 240;     // E1: bars (working TF) scanned for swing pivots / pools
+input bool   InpReqLiqTarget       = false;  // E1: HARD-require an untapped liquidity target in trade direction
+input bool   InpUseTimeEngine      = true;   // E2: algorithmic daily-cycle / session-liquidation timing
+input int    InpAsiaStartHour     = 0;       // E2: Asia/Sydney range START hour (BROKER server time) - CALIBRATE
+input int    InpAsiaEndHour       = 2;       // E2: Asia/Sydney range END hour (server time)
+input int    InpLiqWindowEndHour  = 6;       // E2: by this hour one Asia side should be swept; entries before sweep blocked
+input bool   InpUseRegimeEngine    = true;   // E3: external/internal + HTF containment (block counter-trend traps)
+input bool   InpUseCycleEngine     = true;   // E4: weekly/monthly tail-then-body bias
+input bool   InpUsePrecisionEngine = true;   // E5: refine entry/SL to last-liquidity-grab origin
+input bool   InpUseBreakEngine     = true;   // E6: nature-of-break (wick vs momentum body)
+input bool   InpUseCrossAsset      = false;  // E7: cross-asset confluence (configure symbols below)
+input string InpCorrSymbol1       = "";      // E7: correlated symbol 1 (e.g. EURUSD)
+input int    InpCorrSign1         = 1;       // E7: sign of symbol 1 vs this symbol (+1 same / -1 inverse)
+input string InpCorrSymbol2       = "";      // E7: correlated symbol 2 (e.g. USDX / DXY)
+input int    InpCorrSign2         = -1;      // E7: sign of symbol 2 vs this symbol
+input int    InpCorrLookback      = 12;      // E7: bars (working TF) for correlated-symbol direction
+
+//------------------------- engine outputs (globals) ---------------
+double me_poolHi[64]; int me_poolHiCnt[64]; int me_poolHiN=0;     // E1 buy-side liquidity pools (highs)
+double me_poolLo[64]; int me_poolLoCnt[64]; int me_poolLoN=0;     // E1 sell-side liquidity pools (lows)
+double me_liqTargetAbove=DBL_MAX, me_liqTargetBelow=DBL_MAX;       // E1 nearest untapped magnet each side
+double me_lastSweptLow=DBL_MAX,  me_lastSweptHigh=DBL_MAX;         // E1 last liquidity grab (origin) each side
+bool   me_poiHasLiqIntoBuy=false, me_poiHasLiqIntoSell=false;      // E1 liquidity feeding INTO the POI
+bool   me_poiFreeBuy=true,        me_poiFreeSell=true;             // E1 POI itself free of liquidity
+double me_dayOpen=DBL_MAX,me_dayHigh=DBL_MAX,me_dayLow=DBL_MAX;    // E2
+double me_asiaHigh=DBL_MAX,me_asiaLow=DBL_MAX; bool me_asiaDone=false;
+int    me_asiaSideLiquidated=0; bool me_inPreLiq=false, me_timeGateOK=true;
+int    me_dailyBias=0; bool me_expectLowFirstDay=true;
+int    me_externalDir=0,me_internalDir=0,me_governingDir=0;        // E3
+bool   me_regimeContained=false, me_tradingExternal=true; double me_htfOrigin=DBL_MAX;
+double me_monthOpen=DBL_MAX,me_monthHigh=DBL_MAX,me_monthLow=DBL_MAX;  // E4
+double me_weekOpen=DBL_MAX,me_weekHigh=DBL_MAX,me_weekLow=DBL_MAX;
+int    me_monthBias=0,me_weekBias=0; bool me_expectLowFirst=true, me_monthTailDone=false;
+int    me_breakDir=0; double me_breakQuality=0; bool me_breakIsMomentum=false, me_breakIsWick=false;  // E6
+int    me_corrDir=0,me_corrVotes=0,me_corrSum=0;                   // E7
+double me_refinedSL=DBL_MAX,me_refinedEntry=DBL_MAX; bool me_precisionValid=false;  // E5
+int    me_phaseNum=0; string me_phaseLabel="-";                   // E8
+
+//------------------------- low-level helpers ----------------------
+bool meIsSwingHigh(const ENUM_TIMEFRAMES tf,const int sh,const int k)
+{
+   double h=iHigh(_Symbol,tf,sh); if(h<=0) return(false);
+   for(int j=1;j<=k;j++){ if(iHigh(_Symbol,tf,sh+j)>h) return(false); if(iHigh(_Symbol,tf,sh-j)>h) return(false); }
+   return(true);
+}
+bool meIsSwingLow(const ENUM_TIMEFRAMES tf,const int sh,const int k)
+{
+   double l=iLow(_Symbol,tf,sh); if(l<=0) return(false);
+   for(int j=1;j<=k;j++){ double a=iLow(_Symbol,tf,sh+j),b=iLow(_Symbol,tf,sh-j); if(a>0&&a<l) return(false); if(b>0&&b<l) return(false); }
+   return(true);
+}
+void meAddPool(double &arr[],int &cnt[],int &n,const double price)
+{
+   double atr=cur_atr>0?cur_atr:10*_Point; double tol=atr*InpEqTolAtr;
+   for(int i=0;i<n;i++){ if(MathAbs(arr[i]-price)<=tol){ arr[i]=(arr[i]*cnt[i]+price)/(cnt[i]+1.0); cnt[i]++; return; } }
+   if(n<64){ arr[n]=price; cnt[n]=1; n++; }
+}
+
+//==================================================================
+// E2  ALGORITHMIC TIME / DAILY-CYCLE ENGINE  (run first; E1 uses Asia)
+//==================================================================
+void meUpdateDailyCycle()
+{
+   MqlDateTime now; TimeToStruct(TimeCurrent(),now);
+   me_dayOpen=iOpen(_Symbol,PERIOD_D1,0); me_dayHigh=iHigh(_Symbol,PERIOD_D1,0); me_dayLow=iLow(_Symbol,PERIOD_D1,0);
+
+   // build today's Asia/Sydney range over the configured hour window (working off M15)
+   double ah=-DBL_MAX, al=DBL_MAX; bool any=false;
+   for(int sh=1; sh<=160; sh++){
+      datetime t=iTime(_Symbol,PERIOD_M15,sh); if(t<=0) break;
+      MqlDateTime d; TimeToStruct(t,d);
+      if(!(d.year==now.year && d.mon==now.mon && d.day==now.day)) break;   // crossed to prior day
+      int hr=d.hour;
+      bool inAsia=(InpAsiaStartHour<=InpAsiaEndHour)?(hr>=InpAsiaStartHour&&hr<InpAsiaEndHour)
+                                                    :(hr>=InpAsiaStartHour||hr<InpAsiaEndHour);
+      if(inAsia){ double hh=iHigh(_Symbol,PERIOD_M15,sh),ll=iLow(_Symbol,PERIOD_M15,sh);
+                  if(hh>ah)ah=hh; if(ll<al)al=ll; any=true; }
+   }
+   if(any){ me_asiaHigh=ah; me_asiaLow=al; } else { me_asiaHigh=NA; me_asiaLow=NA; }
+   me_asiaDone=(now.hour>=InpAsiaEndHour);
+
+   // which side of the Asia range has price already liquidated?
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   me_asiaSideLiquidated=0;
+   if(me_asiaDone && !naf(me_asiaHigh) && !naf(me_asiaLow)){
+      if(bid>me_asiaHigh) me_asiaSideLiquidated=1;
+      else if(bid<me_asiaLow) me_asiaSideLiquidated=-1;
+   }
+
+   // daily bias from the HTF owner (falls back to monthly bias)
+   me_dailyBias=(cur_ownerDir!=0)?cur_ownerDir:me_monthBias;
+   me_expectLowFirstDay=(me_dailyBias>=0);
+
+   // PRE-LIQUIDATION gate: don't hunt entries while the range is still building,
+   // or after it builds but before one side is swept (the "don't trade before 1:00" rule)
+   bool inAsiaNow=(InpAsiaStartHour<=InpAsiaEndHour)?(now.hour>=InpAsiaStartHour&&now.hour<InpAsiaEndHour)
+                                                    :(now.hour>=InpAsiaStartHour||now.hour<InpAsiaEndHour);
+   me_inPreLiq=false;
+   if(inAsiaNow) me_inPreLiq=true;
+   else if(me_asiaDone && me_asiaSideLiquidated==0 && now.hour<InpLiqWindowEndHour) me_inPreLiq=true;
+   me_timeGateOK=!me_inPreLiq;
+}
+//--- E2 confidence: favourable timing window for this direction ---
+double meTimeConf(const int dir)
+{
+   if(!InpUseTimeEngine) return(100.0);
+   double c=50.0;
+   if(dir==me_dailyBias) c+=30.0;
+   // a buy wants the LOW swept first (low-of-day printed); a sell wants the HIGH swept
+   if((dir==1 && me_asiaSideLiquidated==-1) || (dir==-1 && me_asiaSideLiquidated==1)) c+=20.0;
+   else if((dir==1 && me_asiaSideLiquidated==1) || (dir==-1 && me_asiaSideLiquidated==-1)) c-=15.0;
+   return(clamp(c,0,100));
+}
+
+//==================================================================
+// E1  LIQUIDITY ENGINE
+//==================================================================
+void meUpdateLiquidity()
+{
+   me_poolHiN=0; me_poolLoN=0;
+   ENUM_TIMEFRAMES tf=_Period; int k=2;
+   int look=InpLiqSwingLookback;
+   for(int sh=k+1; sh<=look; sh++){
+      if(meIsSwingHigh(tf,sh,k)) meAddPool(me_poolHi,me_poolHiCnt,me_poolHiN,iHigh(_Symbol,tf,sh));
+      if(meIsSwingLow(tf,sh,k))  meAddPool(me_poolLo,me_poolLoCnt,me_poolLoN,iLow(_Symbol,tf,sh));
+   }
+   // session / day / week extremes are liquidity too
+   double pdh=iHigh(_Symbol,PERIOD_D1,1),pdl=iLow(_Symbol,PERIOD_D1,1);
+   double pwh=iHigh(_Symbol,PERIOD_W1,1),pwl=iLow(_Symbol,PERIOD_W1,1);
+   if(pdh>0) meAddPool(me_poolHi,me_poolHiCnt,me_poolHiN,pdh);
+   if(pwh>0) meAddPool(me_poolHi,me_poolHiCnt,me_poolHiN,pwh);
+   if(pdl>0) meAddPool(me_poolLo,me_poolLoCnt,me_poolLoN,pdl);
+   if(pwl>0) meAddPool(me_poolLo,me_poolLoCnt,me_poolLoN,pwl);
+   if(!naf(me_asiaHigh)) meAddPool(me_poolHi,me_poolHiCnt,me_poolHiN,me_asiaHigh);
+   if(!naf(me_asiaLow))  meAddPool(me_poolLo,me_poolLoCnt,me_poolLoN,me_asiaLow);
+
+   double atr=cur_atr>0?cur_atr:10*_Point; double px=iClose(_Symbol,tf,1);
+
+   // nearest untapped magnet each side
+   me_liqTargetAbove=NA; me_liqTargetBelow=NA;
+   for(int i=0;i<me_poolHiN;i++){ double p=me_poolHi[i]; if(p>px+atr*0.2 && (naf(me_liqTargetAbove)||p<me_liqTargetAbove)) me_liqTargetAbove=p; }
+   for(int i=0;i<me_poolLoN;i++){ double p=me_poolLo[i]; if(p<px-atr*0.2 && (naf(me_liqTargetBelow)||p>me_liqTargetBelow)) me_liqTargetBelow=p; }
+
+   // last liquidity grab (origin of the impulse) = recent swing that pierced an older pool then reclaimed
+   me_lastSweptLow=NA; me_lastSweptHigh=NA;
+   for(int sh=2; sh<=30; sh++){
+      if(naf(me_lastSweptLow) && meIsSwingLow(tf,sh,2)){
+         double l=iLow(_Symbol,tf,sh); bool took=false;
+         for(int j=sh+2;j<=sh+20 && j<=look;j++){ if(meIsSwingLow(tf,j,2)){ double ol=iLow(_Symbol,tf,j); if(ol>l && ol<l+atr*0.8){ took=true; break; } } }
+         if(took && px>l) me_lastSweptLow=l;
+      }
+      if(naf(me_lastSweptHigh) && meIsSwingHigh(tf,sh,2)){
+         double h=iHigh(_Symbol,tf,sh); bool took=false;
+         for(int j=sh+2;j<=sh+20 && j<=look;j++){ if(meIsSwingHigh(tf,j,2)){ double oh=iHigh(_Symbol,tf,j); if(oh<h && oh>h-atr*0.8){ took=true; break; } } }
+         if(took && px<h) me_lastSweptHigh=h;
+      }
+   }
+   me_poiHasLiqIntoBuy=!naf(me_lastSweptLow);
+   me_poiHasLiqIntoSell=!naf(me_lastSweptHigh);
+
+   // POI free of liquidity = entry not sitting on a strong (>=2) cluster within 0.3 ATR
+   me_poiFreeBuy=true; me_poiFreeSell=true;
+   for(int i=0;i<me_poolLoN;i++) if(me_poolLoCnt[i]>=2 && MathAbs(me_poolLo[i]-px)<=atr*0.3) me_poiFreeBuy=false;
+   for(int i=0;i<me_poolHiN;i++) if(me_poolHiCnt[i]>=2 && MathAbs(me_poolHi[i]-px)<=atr*0.3) me_poiFreeSell=false;
+}
+double meLiquidityConf(const int dir)
+{
+   if(!InpUseLiquidityEngine) return(100.0);
+   double atr=cur_atr>0?cur_atr:10*_Point; double px=iClose(_Symbol,_Period,1);
+   double tgt=(dir==1)?me_liqTargetAbove:me_liqTargetBelow;
+   if(naf(tgt)) return(25.0);                         // no liquidity to run to
+   double dist=MathAbs(tgt-px)/atr;
+   double roomConf=(dist<0.5?30.0:dist<1.0?60.0:dist<6.0?100.0:70.0);
+   double fedConf =((dir==1)?me_poiHasLiqIntoBuy:me_poiHasLiqIntoSell)?100.0:45.0;
+   double freeConf=((dir==1)?me_poiFreeBuy:me_poiFreeSell)?100.0:60.0;
+   return(clamp(roomConf*0.5+fedConf*0.3+freeConf*0.2,0,100));
+}
+
+//==================================================================
+// E3  EXTERNAL-vs-INTERNAL REGIME + HTF ONE-IMPULSE CONTAINMENT
+//==================================================================
+void meUpdateRegime()
+{
+   double atr=cur_atr>0?cur_atr:10*_Point;
+   double h4now=iClose(_Symbol,PERIOD_H4,1),h4past=iClose(_Symbol,PERIOD_H4,6);
+   me_externalDir=(h4now>0&&h4past>0)?(h4now>h4past+atr?1:h4now<h4past-atr?-1:0):0;
+   double m15now=iClose(_Symbol,_Period,1),m15past=iClose(_Symbol,_Period,8);
+   me_internalDir=(m15now>0&&m15past>0)?(m15now>m15past+atr*0.3?1:m15now<m15past-atr*0.3?-1:0):0;
+
+   double hi=-DBL_MAX,lo=DBL_MAX; for(int s=1;s<=6;s++){ double H=iHigh(_Symbol,PERIOD_H4,s),L=iLow(_Symbol,PERIOD_H4,s); if(H>hi)hi=H; if(L>0&&L<lo)lo=L; }
+   double h4leg=hi-lo;
+   double mhi=-DBL_MAX,mlo=DBL_MAX; for(int s=1;s<=16;s++){ double H=iHigh(_Symbol,_Period,s),L=iLow(_Symbol,_Period,s); if(H>mhi)mhi=H; if(L>0&&L<mlo)mlo=L; }
+   double mrange=mhi-mlo;
+
+   // internal counter-structure that fits inside one HTF impulse leg = manipulation
+   me_regimeContained=(h4leg>0 && mrange<h4leg*0.6 && me_internalDir!=0 && me_externalDir!=0 && me_internalDir!=me_externalDir);
+   me_htfOrigin=(me_externalDir==1)?lo:(me_externalDir==-1?hi:NA);
+
+   if(me_regimeContained)                       me_governingDir=me_externalDir;
+   else if(me_internalDir==me_externalDir)       me_governingDir=me_externalDir;
+   else                                          me_governingDir=(me_internalDir!=0?me_internalDir:me_externalDir);
+   me_tradingExternal=(me_governingDir==me_externalDir);
+}
+double meRegimeConf(const int dir)
+{
+   if(!InpUseRegimeEngine || me_governingDir==0) return(70.0);
+   return(dir==me_governingDir?100.0:30.0);
+}
+
+//==================================================================
+// E4  HIGHER-CYCLE BIAS  (weekly / monthly tail-then-body)
+//==================================================================
+void meUpdateCycle()
+{
+   me_monthOpen=iOpen(_Symbol,PERIOD_MN1,0); me_monthHigh=iHigh(_Symbol,PERIOD_MN1,0); me_monthLow=iLow(_Symbol,PERIOD_MN1,0);
+   me_weekOpen =iOpen(_Symbol,PERIOD_W1,0);  me_weekHigh =iHigh(_Symbol,PERIOD_W1,0);  me_weekLow =iLow(_Symbol,PERIOD_W1,0);
+   double mc1=iClose(_Symbol,PERIOD_MN1,1),mo1=iOpen(_Symbol,PERIOD_MN1,1);
+   double wc1=iClose(_Symbol,PERIOD_W1,1), wo1=iOpen(_Symbol,PERIOD_W1,1);
+   me_monthBias=(mc1>0&&mo1>0)?(mc1>mo1?1:mc1<mo1?-1:0):0;
+   me_weekBias =(wc1>0&&wo1>0)?(wc1>wo1?1:wc1<wo1?-1:0):0;
+   me_expectLowFirst=(me_monthBias>=0);
+   double px=iClose(_Symbol,_Period,1);
+   me_monthTailDone=(me_monthBias>0)?(!naf(me_monthOpen)&&px>me_monthOpen):(me_monthBias<0?(!naf(me_monthOpen)&&px<me_monthOpen):false);
+}
+double meCycleConf(const int dir)
+{
+   if(!InpUseCycleEngine) return(100.0);
+   double c=50.0;
+   if(dir==me_monthBias && me_monthBias!=0) c+=25.0;
+   if(dir==me_weekBias  && me_weekBias!=0)  c+=25.0;
+   if((me_monthBias!=0 && dir==-me_monthBias)) c-=15.0;
+   return(clamp(c,0,100));
+}
+
+//==================================================================
+// E6  NATURE-OF-BREAK CLASSIFIER  (wick-through vs momentum body)
+//==================================================================
+void meUpdateBreak()
+{
+   ENUM_TIMEFRAMES tf=_Period; double atr=cur_atr>0?cur_atr:10*_Point;
+   me_breakDir=0; me_breakQuality=0; me_breakIsMomentum=false; me_breakIsWick=false;
+   for(int sh=1; sh<=60; sh++){
+      double level=NA, levelL=NA;
+      for(int j=sh+1;j<=sh+15;j++){ if(meIsSwingHigh(tf,j,2)){ level=iHigh(_Symbol,tf,j); break; } }
+      for(int j=sh+1;j<=sh+15;j++){ if(meIsSwingLow(tf,j,2)){ levelL=iLow(_Symbol,tf,j); break; } }
+      double o=iOpen(_Symbol,tf,sh),h=iHigh(_Symbol,tf,sh),l=iLow(_Symbol,tf,sh),c=iClose(_Symbol,tf,sh);
+      double rng=fmax2(h-l,1e-9),bf=MathAbs(c-o)/rng;
+      if(!naf(level) && h>level){
+         bool closed=(c>level); double beyond=(c-level)/atr;
+         me_breakDir=1; me_breakQuality=clamp(bf*100,0,100);
+         me_breakIsMomentum=(closed && bf>=0.55 && beyond>=0.3); me_breakIsWick=!me_breakIsMomentum; break;
+      }
+      if(!naf(levelL) && l<levelL){
+         bool closed=(c<levelL); double beyond=(levelL-c)/atr;
+         me_breakDir=-1; me_breakQuality=clamp(bf*100,0,100);
+         me_breakIsMomentum=(closed && bf>=0.55 && beyond>=0.3); me_breakIsWick=!me_breakIsMomentum; break;
+      }
+   }
+}
+double meBreakConf(const int dir)
+{
+   if(!InpUseBreakEngine || me_breakDir==0) return(60.0);
+   // a valid spec entry follows a change-of-character INTO our direction with intention
+   if(me_breakDir==dir) return(me_breakIsMomentum?100.0:55.0);
+   return(35.0);
+}
+
+//==================================================================
+// E7  CROSS-ASSET CONFLUENCE
+//==================================================================
+int meSymDir(const string sym,const int lookback,const int corrsign)
+{
+   if(sym=="") return(0);
+   double c1=iClose(sym,_Period,1),c0=iClose(sym,_Period,lookback);
+   if(c1<=0||c0<=0) return(0);                        // symbol unavailable
+   int d=(c1>c0?1:c1<c0?-1:0);
+   return(d*corrsign);
+}
+void meUpdateCross()
+{
+   me_corrDir=0; me_corrVotes=0; me_corrSum=0;
+   int d1=meSymDir(InpCorrSymbol1,InpCorrLookback,InpCorrSign1); if(d1!=0){ me_corrVotes++; me_corrSum+=d1; }
+   int d2=meSymDir(InpCorrSymbol2,InpCorrLookback,InpCorrSign2); if(d2!=0){ me_corrVotes++; me_corrSum+=d2; }
+   me_corrDir=(me_corrSum>0?1:me_corrSum<0?-1:0);
+}
+double meCrossConf(const int dir)
+{
+   if(!InpUseCrossAsset || me_corrVotes==0) return(75.0);   // no data -> neutral
+   double agree=(me_corrSum*dir>0)?(double)MathAbs(me_corrSum)/(double)me_corrVotes:0.0;
+   return(clamp(40.0+agree*60.0,0,100));
+}
+
+//==================================================================
+// E5  POI PRECISION REFINEMENT  (last-liquidity-grab origin)
+//==================================================================
+void meUpdatePrecision()
+{
+   me_refinedSL=NA; me_refinedEntry=NA; me_precisionValid=false;
+   double atr=cur_atr>0?cur_atr:10*_Point; double px=iClose(_Symbol,_Period,1);
+   if(cur_mtfEntryDir==1 && !naf(me_lastSweptLow)){ me_refinedSL=me_lastSweptLow-atr*0.3; me_refinedEntry=px; me_precisionValid=(px>me_lastSweptLow); }
+   else if(cur_mtfEntryDir==-1 && !naf(me_lastSweptHigh)){ me_refinedSL=me_lastSweptHigh+atr*0.3; me_refinedEntry=px; me_precisionValid=(px<me_lastSweptHigh); }
+}
+double mePrecisionConf(const int dir)
+{
+   if(!InpUsePrecisionEngine || !me_precisionValid) return(55.0);
+   double atr=cur_atr>0?cur_atr:10*_Point; double px=iClose(_Symbol,_Period,1);
+   double d=(dir==1)?(px-me_lastSweptLow):(me_lastSweptHigh-px);
+   double datr=(atr>0)?d/atr:0;
+   return(datr<3.0?100.0:datr<6.0?75.0:50.0);
+}
+
+//==================================================================
+// E8  PHASE 1-5 CYCLICAL LABELS  (OUTPUT ONLY - never an input)
+//==================================================================
+void meUpdatePhase()
+{
+   bool ctxOn=InpUseV60Context;
+   bool entryActive=(cur_entryReady=="Entry Active");
+   int p; string sub;
+   if(entryActive || cur_domTransfer>=70.0)                          { p=4; sub="phase-4 (expansion ready)"; }
+   else if(cur_domTransfer>=45.0)                                    { p=3; sub="phase-3 (toward anchor)"; }
+   else if(cur_recDepth>=1 || StringFind(cur_transState,"LATE")>=0)  { p=2; sub="phase-2 (change of character)"; }
+   else if(StringFind(cur_transState,"TERMINAL")>=0)                 { p=5; sub="phase-5 (new structure)"; }
+   else if(ctxOn && ctx_inManipBand)                                 { p=1; sub="phase-1 (manipulated return)"; }
+   else                                                              { p=1; sub="phase-1 (return)"; }
+   me_phaseNum=p; me_phaseLabel=sub;
+}
+
+//==================================================================
+// UMBRELLA UPDATE  (called once per new bar, after ComputeEngine)
+//==================================================================
+void UpdateMethodologyEngines()
+{
+   if(InpUseTimeEngine || InpUseLiquidityEngine) meUpdateDailyCycle();   // Asia range feeds E1
+   if(InpUseCycleEngine)     meUpdateCycle();                            // monthly bias feeds E2 dailyBias
+   if(InpUseLiquidityEngine) meUpdateLiquidity();
+   if(InpUseRegimeEngine)    meUpdateRegime();
+   if(InpUseBreakEngine)     meUpdateBreak();
+   if(InpUseCrossAsset)      meUpdateCross();
+   if(InpUsePrecisionEngine) meUpdatePrecision();
+   meUpdatePhase();                                                      // output label, always
+}
+
+//--- accumulate a confidence factor (0..100) into a geometric-mean product ---
+void meAddF(const double conf,double &logsum,int &cnt)
+{
+   double c=clamp(conf,1.0,100.0)/100.0;   // floor avoids log(0)
+   logsum+=MathLog(c); cnt++;
+}
+
+
 //--- returns true and fills (dir, execProb, reason) when the spec engine says EXECUTE ---
 bool SpecEntryDecision(int &dir,double &execProb,string &reason)
 {
    dir=0; execProb=0.0; reason="";
 
-   //--- DIRECTION: the NEW recursive wave at the terminal. A fresh
-   //    Demand/Supply Return on the OWNING rung IS the entry-cycle event
-   //    (12 = Demand Return = LONG, 13 = Supply Return = SHORT).
-   //    No arrows, no death-count, no phase label. ---
+   //--- DIRECTION: a fresh Demand/Supply Return on the OWNING curve = the entry-cycle event ---
    if(!cur_mtfEntryFresh || cur_mtfEntryDir==0){ reason="no entry-cycle event (awaiting fresh Return on owning curve)"; return(false); }
    dir=cur_mtfEntryDir;
 
-   //--- 1) OWNERSHIP / DOMINANCE TRANSFER -- first strike vs entry cycle.
-   //    THE most important spec gate. A Return whose dominance has NOT
-   //    transferred to the recursive wave is a FIRST STRIKE -> wait. ---
-   double ownershipConf = clamp(cur_mtfEntryDom,0.0,100.0);
+   // ================= HARD SPEC GATES =================
+   //--- 1) Ownership / dominance transfer: first strike vs entry cycle ---
    if(cur_mtfEntryDom < InpMinDomTransfer){
-      reason="FIRST STRIKE on "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < entry-cycle "+IntegerToString((int)InpMinDomTransfer)+"%) -- building, not executing";
+      reason="FIRST STRIKE on "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < "+IntegerToString((int)InpMinDomTransfer)+"%) -- building, not executing";
       return(false);
    }
-
-   //--- 2) TRANSITION MATURITY -- has the high/zone actually converted? ---
-   double maturityConf = clamp(cur_transMaturity,0.0,100.0);
-
-   //--- 3) GEOMETRY / TERMINAL PROXIMITY -- the flip zone is where the
-   //    curve comes alive; entries belong here, never mid-trend. ---
+   //--- 3) Geometry: at the HTF flip terminal (curve-alive zone) ---
    bool   ctxOn  = InpUseV60Context;
    bool   atFlip = ctxOn ? ctx_atFlip : (cur_distFlipAtr<=InpSpecFlipAtr);
    double dFlip  = ctxOn ? ctx_distFlipAtr : cur_distFlipAtr;
-   double geometryConf = atFlip ? 100.0 : clamp(100.0*(1.0 - dFlip/3.0),0.0,100.0);
    if(InpSpecRequireFlip && !atFlip && dFlip>InpSpecFlipAtr){
-      reason="not at HTF flip terminal ("+DoubleToString(dFlip,1)+" ATR away) -- curve not alive yet";
-      return(false);
+      reason="not at HTF flip terminal ("+DoubleToString(dFlip,1)+" ATR away) -- curve not alive yet"; return(false);
    }
-
-   //--- 4) OWNER-DRIVEN DESTINATION -- room to the owner curve's objective ---
-   double destinationConf = clamp(cur_curveBudget,0.0,100.0);
+   //--- 4) Owner-driven destination room ---
    if(cur_curveBudget < InpSpecMinBudget){
-      reason="no destination room (budget "+IntegerToString((int)cur_curveBudget)+"% < "+IntegerToString((int)InpSpecMinBudget)+"%) -- already at objective";
-      return(false);
+      reason="no destination room (budget "+IntegerToString((int)cur_curveBudget)+"% < "+IntegerToString((int)InpSpecMinBudget)+"%)"; return(false);
+   }
+   //--- E2 TIME gate: don't hunt entries before one side of Asia is swept (anti pre-liquidation chop) ---
+   if(InpUseTimeEngine && !me_timeGateOK){
+      reason="PRE-LIQUIDATION window (Asia range building / no sweep yet) -- wait for the liquidation"; return(false);
+   }
+   //--- E3 REGIME gate: block internal counter-trend traps inside one HTF impulse ---
+   if(InpUseRegimeEngine && me_regimeContained && dir!=me_governingDir){
+      reason="COUNTER-TREND trap: internal "+(dir==1?"buy":"sell")+" inside HTF "+(me_governingDir==1?"bull":"bear")+" impulse (price targets HTF origin)"; return(false);
+   }
+   //--- E1 LIQUIDITY room gate (optional hard) ---
+   if(InpUseLiquidityEngine && InpReqLiqTarget){
+      double tgt=(dir==1)?me_liqTargetAbove:me_liqTargetBelow;
+      if(naf(tgt)){ reason="no untapped liquidity target in "+(dir==1?"buy":"sell")+" direction"; return(false); }
    }
 
-   //--- 5) RECURSION RESOLUTION -- compression controls recursion count.
-   //    High compression -> failure swing + tiny recursions resolve fast;
-   //    low compression -> the big recursive cycles must complete first. ---
+   // ================= CONTINUOUS FACTORS (geometric mean) =================
+   //--- original 5 spec factors ---
+   double ownershipConf =clamp(cur_mtfEntryDom,0,100);
+   double maturityConf  =clamp(cur_transMaturity,0,100);
+   double geometryConf  =atFlip?100.0:clamp(100.0*(1.0-dFlip/3.0),0,100);
+   double destinationConf=clamp(cur_curveBudget,0,100);
    double recursionConf;
-   bool failSwing = ctxOn && ctx_failureSwing;
-   bool extreme   = (cur_compRegime=="Extreme");
-   if(cur_recursiveComplete || (extreme && failSwing)) recursionConf=100.0;
-   else {
-      int doneR = cur_recDepth;
-      int needR = (cur_expRecDepth>0?cur_expRecDepth:0);
-      recursionConf = ((doneR+needR)>0) ? clamp(100.0*(double)doneR/(double)(doneR+needR),0.0,100.0) : 60.0;
-      if(cur_compRegime=="High") recursionConf=clamp(recursionConf+20.0,0.0,100.0);  // high compression shortens required recursion
-   }
+   { bool fs=ctxOn&&ctx_failureSwing; bool ex=(cur_compRegime=="Extreme");
+     if(cur_recursiveComplete||(ex&&fs)) recursionConf=100.0;
+     else{ int dR=cur_recDepth, nR=(cur_expRecDepth>0?cur_expRecDepth:0);
+           recursionConf=((dR+nR)>0)?clamp(100.0*(double)dR/(double)(dR+nR),0,100):60.0;
+           if(cur_compRegime=="High") recursionConf=clamp(recursionConf+20.0,0,100); } }
 
-   //--- COMBINE: geometric mean (AND-semantics) -> executionProbability ---
-   double prod = (ownershipConf/100.0)*(maturityConf/100.0)*(geometryConf/100.0)*(destinationConf/100.0)*(recursionConf/100.0);
-   execProb = (prod>0.0) ? 100.0*MathPow(prod,1.0/5.0) : 0.0;
+   //--- methodology engine factors ---
+   double liqC=100,timeC=100,regC=100,cycC=100,brkC=100,xC=100,prcC=100;
+   if(InpUseLiquidityEngine) liqC=meLiquidityConf(dir);
+   if(InpUseTimeEngine)      timeC=meTimeConf(dir);
+   if(InpUseRegimeEngine)    regC=meRegimeConf(dir);
+   if(InpUseCycleEngine)     cycC=meCycleConf(dir);
+   if(InpUseBreakEngine)     brkC=meBreakConf(dir);
+   if(InpUseCrossAsset)      xC =meCrossConf(dir);
+   if(InpUsePrecisionEngine) prcC=mePrecisionConf(dir);
 
-   string _diag=" (own "+IntegerToString((int)ownershipConf)+" / mat "+IntegerToString((int)maturityConf)+
-                " / geo "+IntegerToString((int)geometryConf)+" / dest "+IntegerToString((int)destinationConf)+
-                " / rec "+IntegerToString((int)recursionConf)+")";
-   if(execProb < InpExecProbMin){
-      reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+_diag;
-      return(false);
+   double logsum=0.0; int cnt=0;
+   meAddF(ownershipConf,logsum,cnt); meAddF(maturityConf,logsum,cnt); meAddF(geometryConf,logsum,cnt);
+   meAddF(destinationConf,logsum,cnt); meAddF(recursionConf,logsum,cnt);
+   if(InpUseLiquidityEngine) meAddF(liqC,logsum,cnt);
+   if(InpUseTimeEngine)      meAddF(timeC,logsum,cnt);
+   if(InpUseRegimeEngine)    meAddF(regC,logsum,cnt);
+   if(InpUseCycleEngine)     meAddF(cycC,logsum,cnt);
+   if(InpUseBreakEngine)     meAddF(brkC,logsum,cnt);
+   if(InpUseCrossAsset)      meAddF(xC,logsum,cnt);
+   if(InpUsePrecisionEngine) meAddF(prcC,logsum,cnt);
+
+   execProb=(cnt>0)?100.0*MathExp(logsum/(double)cnt):0.0;
+
+   string diag=" [own"+IntegerToString((int)ownershipConf)+" mat"+IntegerToString((int)maturityConf)+
+               " geo"+IntegerToString((int)geometryConf)+" dst"+IntegerToString((int)destinationConf)+
+               " rec"+IntegerToString((int)recursionConf)+" liq"+IntegerToString((int)liqC)+
+               " tim"+IntegerToString((int)timeC)+" reg"+IntegerToString((int)regC)+
+               " cyc"+IntegerToString((int)cycC)+" brk"+IntegerToString((int)brkC)+
+               " x"+IntegerToString((int)xC)+" prc"+IntegerToString((int)prcC)+"]";
+   if(execProb<InpExecProbMin){
+      reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+diag; return(false);
    }
-   reason="EXECUTE "+(dir==1?"BUY":"SELL")+" execProb="+IntegerToString((int)execProb)+"%"+_diag+
-          " owner="+cur_curveOwner+" comp="+cur_compRegime+" rec="+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth);
+   reason="EXECUTE "+(dir==1?"BUY":"SELL")+" execP="+IntegerToString((int)execProb)+"%"+diag+
+          " owner="+cur_curveOwner+" comp="+cur_compRegime+" phase="+me_phaseLabel;
    return(true);
 }
 
@@ -4523,6 +4911,12 @@ void TryEnter()
    double entry=(dir==1?ask:bid);
    gRecSizeMult=RecSizeMult();                                   // compression -> loop size -> stop width
    double slBase=ComputeStructureSL(dir,entry,false,true);       // mtfEntry=true: stop BEYOND the owning rung's invalidation (the recursive wave's origin)
+   //--- E5 PRECISION: tighten SL to just beyond the last-liquidity-grab origin when valid ---
+   if(InpUsePrecisionEngine && me_precisionValid && !naf(me_refinedSL)){
+      double _atrP=cur_atr>0?cur_atr:10*_Point;
+      if(dir==1  && me_refinedSL<entry && me_refinedSL>slBase && (entry-me_refinedSL)>=_atrP*0.2) slBase=me_refinedSL;
+      if(dir==-1 && me_refinedSL>entry && me_refinedSL<slBase && (me_refinedSL-entry)>=_atrP*0.2) slBase=me_refinedSL;
+   }
    double lot=CalcLot(entry,slBase);
    double tp=ComputeTP(dir,entry,slBase);                        // 0 -> owner-driven exits manage the trade
    if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
@@ -5030,6 +5424,7 @@ void OnTick()
       gLastBarTime=bt;
       gMktClosed=false;          // new bar -> market may have reopened; re-allow management/flip order actions
       ComputeEngine();          // full recompute -> sets cur_* for last closed bar
+      if(InpUseSpecEngine) UpdateMethodologyEngines();  // v13 methodology engines (E1-E8)
       if(g_lastProcessed>=0){
          ManageExhaustionExit(); // SYMPHONY composite terminal-exhaustion exit (closed-bar)
          TryEnter();             // evaluate entry on the just-closed bar
