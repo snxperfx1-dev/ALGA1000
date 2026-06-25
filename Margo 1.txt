@@ -4351,183 +4351,156 @@ bool SymphonyTrigger(const int dir)
    return(true);
 }
 
+//==================================================================
+//  v13 SPEC ENTRY ENGINE  (single source of truth)
+//==================================================================
+//  Replaces BOTH legacy entry systems:
+//    (a) the ownership-death fast-path  (fired 782/788 trades; entered
+//        on a raw 2-of-4 binary death count, "skip all intermediate
+//        gates / no prerequisites"); and
+//    (b) the belief/_entryReadyGate -> arrow / MTF / FU / aggressive
+//        tangle.
+//
+//  The new engine makes decisions ONLY from continuous engine outputs,
+//  in the exact structure of the spec. Phases are NEVER read as inputs.
+//
+//  The market is a recursive curve-ownership process. An entry is valid
+//  only when the NEW recursive wave has actually taken ownership at the
+//  terminal (flip) zone -- i.e. the ENTRY CYCLE has begun, not the FIRST
+//  STRIKE. Five continuous confidences (0..100) are computed from the
+//  ownership / transition / geometry / destination / recursion engines
+//  and combined as a GEOMETRIC MEAN -> executionProbability. The
+//  geometric mean enforces AND-semantics: if ANY engine is weak, the
+//  trade is killed (which is exactly the spec's intent).
+//
+//    1. Ownership / Dominance Transfer  (cur_mtfEntryDom)
+//         Has control transferred to the recursive wave?
+//         first strike (low dom) -> WAIT ; entry cycle (high dom) -> GO
+//    2. Transition Maturity             (cur_transMaturity)
+//         Has the high / zone actually converted (not still building)?
+//    3. Geometry / Terminal proximity   (ctx_atFlip / cur_distFlipAtr)
+//         Are we AT the HTF flip zone where the curve comes alive?
+//    4. Owner-driven Destination room   (cur_curveBudget)
+//         Is there curve left to the owner's objective?
+//    5. Recursion resolution            (compression-aware)
+//         Have the recursive cycles played out (or compressed into a
+//         failure swing)? compression controls recursion count.
+//==================================================================
+input bool   InpUseSpecEngine   = true;   // v13: use the new spec curve-ownership entry engine (replaces legacy death + belief paths)
+input double InpExecProbMin      = 70.0;  // v13: min executionProbability (geometric mean of the 5 spec engines, 0..100) to fire
+input bool   InpSpecRequireFlip  = true;  // v13: require price at the HTF flip terminal (the curve-alive zone) to enter
+input double InpSpecFlipAtr       = 1.5;  // v13: max ATR distance to the flip terminal when the context flip flag is unavailable
+input double InpSpecMinBudget     = 20.0; // v13: min owner-driven destination room (curve budget %) to justify an entry
+
+//--- returns true and fills (dir, execProb, reason) when the spec engine says EXECUTE ---
+bool SpecEntryDecision(int &dir,double &execProb,string &reason)
+{
+   dir=0; execProb=0.0; reason="";
+
+   //--- DIRECTION: the NEW recursive wave at the terminal. A fresh
+   //    Demand/Supply Return on the OWNING rung IS the entry-cycle event
+   //    (12 = Demand Return = LONG, 13 = Supply Return = SHORT).
+   //    No arrows, no death-count, no phase label. ---
+   if(!cur_mtfEntryFresh || cur_mtfEntryDir==0){ reason="no entry-cycle event (awaiting fresh Return on owning curve)"; return(false); }
+   dir=cur_mtfEntryDir;
+
+   //--- 1) OWNERSHIP / DOMINANCE TRANSFER -- first strike vs entry cycle.
+   //    THE most important spec gate. A Return whose dominance has NOT
+   //    transferred to the recursive wave is a FIRST STRIKE -> wait. ---
+   double ownershipConf = clamp(cur_mtfEntryDom,0.0,100.0);
+   if(cur_mtfEntryDom < InpMinDomTransfer){
+      reason="FIRST STRIKE on "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < entry-cycle "+IntegerToString((int)InpMinDomTransfer)+"%) -- building, not executing";
+      return(false);
+   }
+
+   //--- 2) TRANSITION MATURITY -- has the high/zone actually converted? ---
+   double maturityConf = clamp(cur_transMaturity,0.0,100.0);
+
+   //--- 3) GEOMETRY / TERMINAL PROXIMITY -- the flip zone is where the
+   //    curve comes alive; entries belong here, never mid-trend. ---
+   bool   ctxOn  = InpUseV60Context;
+   bool   atFlip = ctxOn ? ctx_atFlip : (cur_distFlipAtr<=InpSpecFlipAtr);
+   double dFlip  = ctxOn ? ctx_distFlipAtr : cur_distFlipAtr;
+   double geometryConf = atFlip ? 100.0 : clamp(100.0*(1.0 - dFlip/3.0),0.0,100.0);
+   if(InpSpecRequireFlip && !atFlip && dFlip>InpSpecFlipAtr){
+      reason="not at HTF flip terminal ("+DoubleToString(dFlip,1)+" ATR away) -- curve not alive yet";
+      return(false);
+   }
+
+   //--- 4) OWNER-DRIVEN DESTINATION -- room to the owner curve's objective ---
+   double destinationConf = clamp(cur_curveBudget,0.0,100.0);
+   if(cur_curveBudget < InpSpecMinBudget){
+      reason="no destination room (budget "+IntegerToString((int)cur_curveBudget)+"% < "+IntegerToString((int)InpSpecMinBudget)+"%) -- already at objective";
+      return(false);
+   }
+
+   //--- 5) RECURSION RESOLUTION -- compression controls recursion count.
+   //    High compression -> failure swing + tiny recursions resolve fast;
+   //    low compression -> the big recursive cycles must complete first. ---
+   double recursionConf;
+   bool failSwing = ctxOn && ctx_failureSwing;
+   bool extreme   = (cur_compRegime=="Extreme");
+   if(cur_recursiveComplete || (extreme && failSwing)) recursionConf=100.0;
+   else {
+      int doneR = cur_recDepth;
+      int needR = (cur_expRecDepth>0?cur_expRecDepth:0);
+      recursionConf = ((doneR+needR)>0) ? clamp(100.0*(double)doneR/(double)(doneR+needR),0.0,100.0) : 60.0;
+      if(cur_compRegime=="High") recursionConf=clamp(recursionConf+20.0,0.0,100.0);  // high compression shortens required recursion
+   }
+
+   //--- COMBINE: geometric mean (AND-semantics) -> executionProbability ---
+   double prod = (ownershipConf/100.0)*(maturityConf/100.0)*(geometryConf/100.0)*(destinationConf/100.0)*(recursionConf/100.0);
+   execProb = (prod>0.0) ? 100.0*MathPow(prod,1.0/5.0) : 0.0;
+
+   string _diag=" (own "+IntegerToString((int)ownershipConf)+" / mat "+IntegerToString((int)maturityConf)+
+                " / geo "+IntegerToString((int)geometryConf)+" / dest "+IntegerToString((int)destinationConf)+
+                " / rec "+IntegerToString((int)recursionConf)+")";
+   if(execProb < InpExecProbMin){
+      reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+_diag;
+      return(false);
+   }
+   reason="EXECUTE "+(dir==1?"BUY":"SELL")+" execProb="+IntegerToString((int)execProb)+"%"+_diag+
+          " owner="+cur_curveOwner+" comp="+cur_compRegime+" rec="+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth);
+   return(true);
+}
+
 void TryEnter()
 {
-   int dir=DesiredDirection();
-   bool aggressive=false, fuEntry=false, mtfEntry=false;
    // ================================================================
-   // DEATH PATH -- HIGHEST PRIORITY. Checked before ANY other logic.
-   // When 2+ death signals confirmed, direction is set immediately.
-   // Macro curve dying -> trade the opposing direction. No prerequisites.
+   //  v13 SPEC ENTRY ENGINE -- the ONLY entry path.
+   //  Both legacy systems removed: (a) ownership-death fast-path and
+   //  (b) the belief/_entryReadyGate -> arrow/MTF/FU/aggressive tangle.
    // ================================================================
-   if(cur_ownerDeathSignals >= 2){
-      int _macDeath = (cur_dirH4!=0)?cur_dirH4:(cur_dirH1!=0)?cur_dirH1:0;
-      if(_macDeath != 0 && dir==0) dir = -_macDeath;  // dying macro -> oppose it
-      // death fast-path: go straight to order, skip all intermediate gates
-      if(_macDeath != 0){
-         // -- SIGNAL QUALITY + SESSION GATES (from deep audit) ----------
-         // These filters remove the statistically confirmed loss clusters:
-         // D=4/4 (EV negative), London D=2/4 (20-29% win), Tuesday D=2/4 (0.56:1),
-         // and the 14:45-15:30 news window (21% win, 10% of all hard SL).
-         MqlDateTime _dte; TimeToStruct(TimeCurrent(),_dte);
-         int _eh=_dte.hour, _em=_dte.min, _wd=_dte.day_of_week;
-         bool _isLondon =(_eh>=6 && _eh<=11);
-         bool _isTuesday=(_wd==2);
-         bool _isNews   =InpBlockNewsWindow && ((_eh==InpNewsHourStart && _em>=InpNewsMinStart)||(_eh==InpNewsHourEnd && _em<=InpNewsMinEnd));
-         bool _isAsia   =(_eh>=0 && _eh<=5);
-         bool _isClose  =(_eh>=18);
-         // Block D=4/4 (consensus = late, avg R=0.38, EV<0)
-         if(InpBlockD4 && cur_ownerDeathSignals>=4){ gEntryBlock="D=4/4 blocked (late consensus)"; return; }
-         // Block D=2/4 during London open (20-29% win rate, wicks tight SLs)
-         if(InpBlockD2London && _isLondon && cur_ownerDeathSignals<=2){ gEntryBlock="D=2/4 blocked in London session"; return; }
-         // Block D=2/4 on Tuesdays (27% SL hits vs 15% winners)
-         if(InpBlockD2Tuesday && _isTuesday && cur_ownerDeathSignals<=2){ gEntryBlock="D=2/4 blocked on Tuesday"; return; }
-         // Block news window 14:45-15:30 (data releases blow through tight SLs)
-         if(_isNews){ gEntryBlock="news window blocked ("+IntegerToString(_eh)+":"+IntegerToString(_em)+")"; return; }
+   if(!InpUseSpecEngine){ gEntryBlock="spec engine off"; return; }
 
-         // -- TRADE TYPE CLASSIFICATION (drives BE SL width + QProt threshold) --
-         // Campaign (type 0): Asia/Close D=2/4 -- slow multi-session hold, needs wide BE
-         // Momentum (type 1): all other confirmed entries -- session move, tighter mgmt
-         int _tradeType = ((_isAsia || _isClose) && cur_ownerDeathSignals==2) ? 0 : 1;
+   int dir=0; double execProb=0.0; string why="";
+   bool go=SpecEntryDecision(dir,execProb,why);
+   gEntryBlock=why;
+   if(!go || dir==0) return;
 
-         if(dir==1 && !InpTradeLongs){ gEntryBlock="longs off"; return; }
-         if(dir==-1 && !InpTradeShorts){ gEntryBlock="shorts off"; return; }
-         if(cur_invInvalidated){ gEntryBlock="invalidated"; return; }
-         if(!SessionOK()){ gEntryBlock="session closed"; return; }
-         int _maxT2=(InpSmallAccount&&InpSmallAcctMaxTrades>0)?(InpMaxTradesPerDay>0?MathMin(InpMaxTradesPerDay,InpSmallAcctMaxTrades):InpSmallAcctMaxTrades):InpMaxTradesPerDay;
-         if(_maxT2>0 && gTradesToday>=_maxT2){ gEntryBlock="max trades/day"; return; }
-         if(InpMaxSpreadPoints>0){ long sp=(long)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD); if(sp>InpMaxSpreadPoints){ gEntryBlock="spread "+IntegerToString((int)sp); return; } }
-         int ownD=OwnPositionDir();
-         if(ownD!=0 && ownD!=dir){
-            if(OwnYoungerThan(InpMinHoldBars)){ gEntryBlock="hold (young pos)"; return; }
-            if(InpReverseOnOpposite){ CloseOwnPositions(0); DeletePendingOrders(); }
-            else { gEntryBlock="opposite pos open"; return; }
-         }
-         if(CountOwnPositions()>=InpMaxPositions){ gEntryBlock="max positions"; return; }
-         if(InpVerifyTradeAllowed && !TradingEnabled()){ gEntryBlock="algo-trading disabled"; return; }
-         sym.RefreshRates();
-         double askD=sym.Ask(), bidD=sym.Bid();
-         double entryD=(dir==1?askD:bidD);
-         gRecSizeMult=RecSizeMult();
-         double slD=ComputeStructureSL(dir,entryD,false,false);
-         double lotD=CalcLot(entryD,slD);
-         if(!MarginOK(dir,lotD,entryD)){ gEntryBlock="insufficient margin"; return; }
-         string _typeTx=(_tradeType==0?"CAMP":"MOM");
-         string cmtD=InpComment+" DEATH"+IntegerToString(cur_ownerDeathSignals)+" "+_typeTx;
-         bool okD=(dir==1)?trade.Buy(lotD,_Symbol,askD,slD,0.0,cmtD):trade.Sell(lotD,_Symbol,bidD,slD,0.0,cmtD);
-         if(!okD && MktClosed()) return;
-         MgRegister(trade.ResultOrder(),slD,NA,dir,true,_tradeType);
-         gTradesToday++; gEntryBlock="ENTERED DEATH"+IntegerToString(cur_ownerDeathSignals)+" "+_typeTx;
-         if(InpDebugEntries) Print("=== ENTRY DEATH ",(dir==1?"BUY":"SELL")," D=",cur_ownerDeathSignals,"/4 type=",_typeTx," @",DoubleToString(entryD,_Digits)," SL=",DoubleToString(slD,_Digits));
-         return;
-      }
-   }
-   //--- NORMAL PATHS (FU / MTF / aggressive / arrow) ---
-   if(dir==0 && InpUseV60Context && InpFUExtremeEntry && ctx_fuFresh && ctx_fuDir!=0){
-      int cb=ConsensusBias();
-      if(InpFURequireBias && cb!=0 && ctx_fuDir!=cb){
-         gEntryBlock="FU "+(ctx_fuDir==1?"buy":"sell")+" node opposes "+(cb==1?"bull":"bear")+" bias";
-      } else {
-         dir=ctx_fuDir; aggressive=true; fuEntry=true;
-      }
-   }
-   //--- MULTI-TF: a fresh Demand/Supply Return on ANY rung (M1..H4) -- the EA sees every timeframe ---
-   //  Only a genuine ENTRY CYCLE (dominance transferred to the recursive wave) qualifies;
-   //  a first strike (low dominance) is skipped -- the curve is still building.
-   if(dir==0 && InpMultiTFEntry && cur_mtfEntryFresh && cur_mtfEntryDir!=0 && cur_mtfEntryWt>=InpMinEntryRung){
-      bool _ctx=InpUseV60Context;
-      bool _okManip = (!InpAvoidManipBand || !_ctx || !ctx_inManipBand || ctx_atTrueInduction);
-      bool _okTrue  = (!InpRequireTrueInduction || !_ctx || ctx_atTrueInduction);
-      bool _okFlip  = (!InpRequireAtFlip || !_ctx || ctx_atFlip);
-      bool _okShift = (InpMinTermShifts<=0 || !_ctx || !ctx_atFlip || ctx_termShifts>=InpMinTermShifts || ctx_failureSwing);
-      bool _okOwner = (!InpOwnerMustAgree || !_ctx || cur_ownerDir==0 || cur_mtfEntryDir==cur_ownerDir
-                       || cur_mtfEntryDom>=InpMinDomTransfer);   // a Return whose dominance has TRANSFERRED is the new curve -> trade the reversal (don't block it)
-      if(cur_mtfEntryDom>=InpMinDomTransfer && cur_entryProb>=InpMinEntryProb && _okFlip && _okShift && _okManip && _okTrue && _okOwner){ dir=cur_mtfEntryDir; aggressive=true; mtfEntry=true; }
-      else if(cur_mtfEntryDom<InpMinDomTransfer) gEntryBlock="first strike "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < entry cycle)";
-      else if(!_okOwner) gEntryBlock=(cur_mtfEntryDir==1?"long":"short")+" vs owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":"bear");
-      else if(!_okManip) gEntryBlock="manipulation band (0.618-0.786, awaiting true flip)";
-      else if(!_okTrue)  gEntryBlock="not at true induction (lowest flip)";
-      else if(!_okFlip)  gEntryBlock="not at flip zone ("+DoubleToString(ctx_distFlipAtr,1)+"ATR away)";
-      else if(!_okShift) gEntryBlock="terminal building "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(InpMinTermShifts)+" shifts";
-      else gEntryBlock="entry prob low "+IntegerToString((int)cur_entryProb)+"%";
-   }
-   //--- aggressive v60-confluence entry when strict Letra has no signal ---
-   if(dir==0 && InpUseV60Context && InpAggressiveEntry){
-      int adir=ctx_waveDir;
-      bool ok = adir!=0
-             && (!InpAggReqNet || ctx_netBias==adir || ctx_netBias==0)
-             && ctx_life>=InpCurveAliveMin
-             && !((ctx_phase=="Liquidation"||ctx_phase=="Terminal Curve") && ctx_waveDir!=adir)
-             && !(InpAggReqTime && InpTIEBlockOpposed && ctx_timeAlign>=InpTIEStrongAlign && ctx_timeDir!=0 && ctx_timeDir!=adir);
-      if(ok){ dir=adir; aggressive=true; }
-   }
-   if(dir==0){ gEntryBlock=(InpUseV60Context&&InpAggressiveEntry)?"no signal / v60 not aligned":"no signal (awaiting Return)"; return; }
+   //--- direction enable / invalidation ---
+   if(dir==1  && !InpTradeLongs){  gEntryBlock="longs off";  return; }
+   if(dir==-1 && !InpTradeShorts){ gEntryBlock="shorts off"; return; }
+   if(cur_invInvalidated){ gEntryBlock="invalidated"; return; }
 
-   // (death fast-path already handled at top of TryEnter -- reaches here only for normal paths)
-   //--- F72 entry-cycle context (computed ONCE, drives the vetoes + the gate below) --------
-   bool _ctxOn=InpUseV60Context;
-   bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
-   int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
-   bool _atFlipNow=(_ctxOn?ctx_atFlip:(cur_distFlipAtr<=1.0));
-   bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
-   bool _freshRet=(cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer);
-   //  TERMINAL entry = the NEW curve has taken control (dominance transferred / Entry Active /
-   //  at the flip with the shift sequence done / failure-swing). At that point we are MEANT to
-   //  trade the NEW curve even though the OLD owner/consensus still reads the prior direction -
-   //  that reversal IS the trade, so it must NOT be vetoed.
-   bool _terminalEntry = (cur_entryReady=="Entry Active") || _freshRet
-                      || (_atFlipNow && _shiftsOK) || _fast || (_ctxOn && ctx_termComplete)
-                      || (cur_ownerDeathSignals >= 2);  // ownership death = terminal entry confirmed
-   //  WITH-CURVE = aligned with the live owning curve (continuation - riding the dominant move).
-   bool _withCurve = (cur_ownerDir!=0 && dir==cur_ownerDir);
-
-   //--- counter-bias veto: blocks RANDOM counter-trend trades, but NEVER a confirmed terminal
-   //--- entry-cycle (that is exactly when we trade the new curve against the old consensus). ---
-
-   //--- FLIP CONTEXT GATE (applies to ALL entry paths including FU/MTF/aggressive) ---
-   //  Ported from V60: ALL curves have a flip zone. BUYS below, SELLS above.
-   //  Use HTF authority ONLY (M15/H1/H4) -- M1/M3 zones are noise and flicker constantly.
-   //  The highest available HTF flip zone defines macro buy/sell territory.
+   //--- SPEC SIDE RULE: buys below the HTF flip (demand), sells above it
+   //    (supply); never enter on the wrong side of the flip. ---
    {
       double _bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
       double _atrGate=cur_atr>0?cur_atr:10*_Point;
-      // Check HTF flip zones in priority order: H4 > H1 > M15 > M5 (skip M1/M3 noise)
       double _htfFlipMid=NA;
       if(!naf(cur_cv_flipMid[5]))      _htfFlipMid=cur_cv_flipMid[5];  // H4
       else if(!naf(cur_cv_flipMid[4])) _htfFlipMid=cur_cv_flipMid[4];  // H1
       else if(!naf(cur_cv_flipMid[3])) _htfFlipMid=cur_cv_flipMid[3];  // M15
       else if(!naf(cur_cv_flipMid[2])) _htfFlipMid=cur_cv_flipMid[2];  // M5
-      if(naf(_htfFlipMid)) _htfFlipMid=cur_ctxFlipMid;  // fallback
-      // Apply the universal rule: buys below flip, sells above flip
+      if(naf(_htfFlipMid)) _htfFlipMid=cur_ctxFlipMid;
       if(!naf(_htfFlipMid)){
-         if(dir==1 && _bid>_htfFlipMid+_atrGate*0.3){ gEntryBlock="buy ABOVE HTF flip zone (sell territory)"; return; }
-         if(dir==-1 && _bid<_htfFlipMid-_atrGate*0.3){ gEntryBlock="sell BELOW HTF flip zone (buy territory)"; return; }
+         if(dir==1  && _bid>_htfFlipMid+_atrGate*0.3){ gEntryBlock="buy ABOVE HTF flip (sell territory)"; return; }
+         if(dir==-1 && _bid<_htfFlipMid-_atrGate*0.3){ gEntryBlock="sell BELOW HTF flip (buy territory)"; return; }
       }
    }
 
-   if(InpBlockCounterBias && !_terminalEntry){
-      int cb=ConsensusBias();
-      if(cb!=0 && dir!=cb){ gEntryBlock=(dir==1?"long":"short")+" vetoed vs "+(cb==1?"BULL":"BEAR")+" thesis"; return; }
-   }
-   //--- F72 UNIFIED ENTRY-CYCLE GATE -- trade WITH the curve -------------------------------
-   //  Allow the entry when it is either (a) aligned with the live OWNER curve (continuation),
-   //  or (b) a confirmed TERMINAL reversal where the new wave has taken control. Only a
-   //  counter-trend, mid-build entry (neither of those) is blocked. A trigger (arrow / DOE /
-   //  FU / fresh Return) is still required to reach here, so this does not over-trade.
-   if(InpRequireEntryCycle){
-      bool _cycleOK = _withCurve || _terminalEntry;
-      if(!_cycleOK){ gEntryBlock="against curve / not entry-cycle (owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":cur_ownerDir==-1?"bear":"flat")+", ready "+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+")"; return; }
-   }
-   //--- SYMPHONY precise trigger: enter on the TURN (closed-bar momentum inflection at the right
-   //  retrace depth, inducement complete) - the "exactly WHEN" on top of the context "WHETHER". ---
-   if(!SymphonyTrigger(dir)) return;
-   if(!aggressive){
-      if(!PassesFilters(dir)) return;          // strict Letra path keeps full filters
-   } else {
-      if(dir==1 && !InpTradeLongs){ gEntryBlock="longs off"; return; }     // aggressive path: light gating only
-      if(dir==-1&& !InpTradeShorts){ gEntryBlock="shorts off"; return; }
-      if(cur_invInvalidated){ gEntryBlock="invalidated"; return; }
-   }
+   //--- execution plumbing (sessions / limits / spread / positions / margin) ---
    if(!SessionOK()){ gEntryBlock="session closed"; return; }
    int _maxTrades=(InpSmallAccount && InpSmallAcctMaxTrades>0)
                   ? (InpMaxTradesPerDay>0? MathMin(InpMaxTradesPerDay,InpSmallAcctMaxTrades) : InpSmallAcctMaxTrades)
@@ -4537,99 +4510,69 @@ void TryEnter()
 
    int ownDir=OwnPositionDir();
    if(ownDir!=0 && ownDir!=dir){
-      if(OwnYoungerThan(InpMinHoldBars)){ gEntryBlock="hold (young pos, no flip)"; return; }   // don't flip a fresh trade
-      if(InpReverseOnOpposite){ if(InpDebugExits) Print("=== FLIP  closing ",(ownDir==1?"BUY":"SELL")," to reverse into ",(dir==1?"BUY":"SELL"),"  (owner ",cur_curveOwner," ",f_waveDirLabel(cur_ownerDir),", thesis ",(ConsensusBias()==1?"BULL":ConsensusBias()==-1?"BEAR":"neutral"),")"); CloseOwnPositions(0); DeletePendingOrders(); }
+      if(OwnYoungerThan(InpMinHoldBars)){ gEntryBlock="hold (young pos)"; return; }
+      if(InpReverseOnOpposite){ if(InpDebugExits) Print("=== FLIP  closing ",(ownDir==1?"BUY":"SELL")," to reverse into ",(dir==1?"BUY":"SELL")); CloseOwnPositions(0); DeletePendingOrders(); }
       else { gEntryBlock="opposite pos open"; return; }
    }
    if(CountOwnPositions()>=InpMaxPositions){ gEntryBlock="max positions"; return; }
-   if(gMktClosed){ gEntryBlock="market closed (flip-close rejected)"; return; }   // a flip/opposite close was rejected because the market is shut -> do NOT open a fresh leg now
-   if(InpVerifyTradeAllowed && !TradingEnabled()){ gEntryBlock="algo-trading disabled / terminal not connected"; return; }
+   if(gMktClosed){ gEntryBlock="market closed (flip-close rejected)"; return; }
+   if(InpVerifyTradeAllowed && !TradingEnabled()){ gEntryBlock="algo-trading disabled"; return; }
 
    sym.RefreshRates();
    double ask=sym.Ask(), bid=sym.Bid();
    double entry=(dir==1?ask:bid);
-   gRecSizeMult=RecSizeMult();          // recursion-size-aware stop sizing (compression -> loop size)
-   double slBase=ComputeStructureSL(dir,entry,fuEntry,mtfEntry);   // F72: stop BEYOND the actual structure price is reacting off
+   gRecSizeMult=RecSizeMult();                                   // compression -> loop size -> stop width
+   double slBase=ComputeStructureSL(dir,entry,false,true);       // mtfEntry=true: stop BEYOND the owning rung's invalidation (the recursive wave's origin)
    double lot=CalcLot(entry,slBase);
-   double tp=ComputeTP(dir,entry,slBase);
-   //--- LIVE: don't send an order the account can't safely afford ---
+   double tp=ComputeTP(dir,entry,slBase);                        // 0 -> owner-driven exits manage the trade
    if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
-   //--- SMALL ACCOUNT: the broker minimum lot may force more risk than allowed (can't size smaller) -> skip ---
    if(InpSmallAccount && InpSmallAcctMaxRiskPct>0.0){
       double _riskMoney=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
       double _riskPctActual=_riskMoney/MathMax(gAccount.Equity(),1.0)*100.0;
       if(_riskPctActual>InpSmallAcctMaxRiskPct){ gEntryBlock="small-acct: min-lot risk "+DoubleToString(_riskPctActual,2)+"% > cap "+DoubleToString(InpSmallAcctMaxRiskPct,2)+"%"; return; }
    }
-   bool _arrow=(dir==1?cur_longSignal:cur_shortSignal);
-   string _trig=fuEntry?"FU":mtfEntry?("MTF:"+cur_mtfEntryTF):aggressive?"V60AGG":_arrow?"ARROW":"DEATH";
-   string cmt=InpComment+" "+_trig+(cur_ownerDeathSignals>0?" D"+IntegerToString(cur_ownerDeathSignals):"");
 
+   //--- TRADE-TYPE for management is now CURVE-DERIVED, not clock-derived.
+   //    Campaign-style (slow, wide BE) when an HTF curve owns price in low
+   //    compression (broad recursive cycles); Momentum-style (tighter) when
+   //    an LTF owns or compression is high (fast micro-recursions). ---
+   bool _htfOwner=(cur_curveOwner=="H1"||cur_curveOwner=="H4"||cur_curveOwner=="M15");
+   bool _lowComp =(cur_compRegime=="Low"||cur_compRegime=="Medium");
+   int  _tradeType=(_htfOwner && _lowComp) ? 0 : 1;
+   string _typeTx=(_tradeType==0?"CAMP":"MOM");
+
+   string cmt=InpComment+" SPEC "+(dir==1?"BUY":"SELL")+" "+_typeTx+" P"+IntegerToString((int)execProb);
+
+   //--- market send with retry on TRANSIENT broker errors ---
    bool ok=false;
-   if(InpUseLimitEntry && !naf(cur_doeEntryMid)){
-      double lim=NormPrice(cur_doeEntryMid);
-      double slL=ComputeStructureSL(dir,lim,fuEntry,mtfEntry);
-      double tpL=ComputeTP(dir,lim,slL);
-      double lotL=CalcLot(lim,slL);
-      datetime exp=(InpPendingExpiryBars>0)?(TimeCurrent()+(datetime)(InpPendingExpiryBars*PeriodSeconds(_Period))):0;
-      ENUM_ORDER_TYPE_TIME tt=(exp>0?ORDER_TIME_SPECIFIED:ORDER_TIME_GTC);
-      trade.SetTypeFillingBySymbol(_Symbol);
-      if(dir==1) ok=trade.BuyLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
-      else       ok=trade.SellLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
-   } else {
-      //--- LIVE: market send with retry on TRANSIENT broker errors (requote / price changed /
-      //  off-quotes / timeout). Re-quote the price each attempt. Non-transient errors stop the loop. ---
-      int _tries=MathMax(1,InpOrderRetries);
-      for(int _a=0;_a<_tries && !ok;_a++){
-         sym.RefreshRates();
-         double _ask=sym.Ask(), _bid=sym.Bid();
-         ok=(dir==1)? trade.Buy(lot,_Symbol,_ask,slBase,tp,cmt)
-                    : trade.Sell(lot,_Symbol,_bid,slBase,tp,cmt);
-         if(ok) break;
-         uint _rc=trade.ResultRetcode();
-         bool _transient=(_rc==TRADE_RETCODE_REQUOTE||_rc==TRADE_RETCODE_PRICE_CHANGED||
-                          _rc==TRADE_RETCODE_PRICE_OFF||_rc==TRADE_RETCODE_TIMEOUT);
-         if(!_transient) break;                       // hard error -> stop (MktClosed() handles the closed-market case below)
-         if(InpRetryWaitMs>0 && !MQLInfoInteger(MQL_TESTER)) Sleep(InpRetryWaitMs);
-      }
+   int _tries=MathMax(1,InpOrderRetries);
+   for(int _a=0;_a<_tries && !ok;_a++){
+      sym.RefreshRates();
+      double _ask=sym.Ask(), _bid=sym.Bid();
+      ok=(dir==1)? trade.Buy(lot,_Symbol,_ask,slBase,tp,cmt) : trade.Sell(lot,_Symbol,_bid,slBase,tp,cmt);
+      if(ok) break;
+      uint _rc=trade.ResultRetcode();
+      bool _transient=(_rc==TRADE_RETCODE_REQUOTE||_rc==TRADE_RETCODE_PRICE_CHANGED||
+                       _rc==TRADE_RETCODE_PRICE_OFF||_rc==TRADE_RETCODE_TIMEOUT);
+      if(!_transient) break;
+      if(InpRetryWaitMs>0 && !MQLInfoInteger(MQL_TESTER)) Sleep(InpRetryWaitMs);
    }
-   if(!ok) MktClosed();   // if the entry was rejected because the market is shut, arm the back-off so the same-tick ManagePositions() does not also hammer the broker
-   if(ok){
-      gTradesToday++;
-      gEntryBlock="ENTERED "+_trig;
-      //--- DEBUG: full entry reasoning so we can map where it needs improving ---
-      if(InpDebugEntries){
-         double _risk=MathAbs(entry-slBase); double _rr=_risk>0?MathAbs(tp-entry)/_risk:0.0;
-         int _cb=ConsensusBias();
-         Print("=== ENTRY ",(dir==1?"BUY":"SELL")," src=",_trig,
-               "  @",DoubleToString(entry,_Digits)," SL=",DoubleToString(slBase,_Digits)," TP=",DoubleToString(tp,_Digits),
-               " lot=",DoubleToString(lot,2)," RR=",DoubleToString(_rr,2)," SLpts=",DoubleToString(_risk/_Point,0));
-         Print("    TRIGGER : arrow=",(_arrow?"Y":"n")," DOE=",cur_doeAction," FU=",(fuEntry?"Y":"n"),
-               " MTF=",(mtfEntry?cur_mtfEntryTF+" dom"+DoubleToString(cur_mtfEntryDom,0)+"%":"n"),
-               " aggr=",(aggressive?"Y":"n"));
-         Print("    OWNER   : ",cur_curveOwner," ",(cur_ownerDir==1?"Bull":cur_ownerDir==-1?"Bear":"Flat"),
-               "  trans=",cur_transState,"  camp=",ctx_campaign,"  atFlip=",(ctx_atFlip?"Y":"n"),"  ready=",cur_entryReady);
-         Print("    RECUR   : dom=",DoubleToString(cur_domTransfer,0),"%  comp=",cur_compRegime,
-               "  depth=",cur_recDepth,"/",cur_expRecDepth,"  budget=",DoubleToString(cur_curveBudget,0),"%  toFlip=",DoubleToString(cur_distFlipAtr,1),"ATR  entryP=",DoubleToString(cur_entryProb,0),"%");
-         Print("    TERMINAL: shifts=",ctx_termShifts,"/",ctx_termExpected,"  m1=",ctx_termM1Cycles,"  done=",(ctx_termComplete?"Y":"n"),
-               "  induction=",(ctx_atTrueInduction?"TRUE":"-"),"  manip=",(ctx_inManipBand?"Y":"n"),"  failSwing=",(ctx_failureSwing?"Y":"n"),"  fuMerged=",(ctx_fuMerged?"Y":"n"));
-         Print("    THESIS  : ",(_cb==1?"BULL":_cb==-1?"BEAR":"neutral"),"  net=",cur_dirM5==0?0:cur_dirM5,"  narr=",cur_cmdNarrative,"  | M1 ",f_waveDirLabel(cur_dirM1)," M5 ",f_waveDirLabel(cur_dirM5)," H1 ",f_waveDirLabel(cur_dirH1)," H4 ",f_waveDirLabel(cur_dirH4));
-      }
-      ulong tk=trade.ResultOrder();
-      // register live position (market entries fill immediately)
-      if(posinfo.SelectByTicket(trade.ResultDeal())) {}
-      // best-effort: register by scanning newest own position
-      for(int q=PositionsTotal()-1;q>=0;q--){
-         ulong pt=PositionGetTicket(q);
-         if(pt==0) continue;
-         if(PositionGetInteger(POSITION_MAGIC)==(long)InpMagic && PositionGetString(POSITION_SYMBOL)==_Symbol){
-            double psl=PositionGetDouble(POSITION_SL);
-            double _openP=PositionGetDouble(POSITION_PRICE_OPEN);
-            double _risk =MathAbs(_openP-slBase); if(_risk<=0) _risk=(cur_atr>0?cur_atr:10*_Point);
-            //--- SPEC AUDIT: no TP1/partial registration. Position registered for SL tracking only. ---
-            MgRegister(pt,psl,NA,dir);
-            break;
-         }
-      }
+   if(!ok){ MktClosed(); return; }
+
+   gTradesToday++;
+   gEntryBlock="ENTERED SPEC "+_typeTx;
+   MgRegister(trade.ResultOrder(),slBase,NA,dir,true,_tradeType);
+   if(InpDebugEntries){
+      double _risk=MathAbs(entry-slBase);
+      Print("=== ENTRY SPEC ",(dir==1?"BUY":"SELL")," ",_typeTx,
+            "  execP=",DoubleToString(execProb,0),"%  @",DoubleToString(entry,_Digits),
+            " SL=",DoubleToString(slBase,_Digits)," lot=",DoubleToString(lot,2)," SLpts=",DoubleToString(_risk/_Point,0));
+      Print("    OWNER   : ",cur_curveOwner," ",(cur_ownerDir==1?"Bull":cur_ownerDir==-1?"Bear":"Flat"),
+            "  trans=",cur_transState,"  atFlip=",(ctx_atFlip?"Y":"n"),"  ready=",cur_entryReady,
+            "  entryTF=",cur_mtfEntryTF,"  dom=",DoubleToString(cur_mtfEntryDom,0),"%");
+      Print("    RECUR   : comp=",cur_compRegime,"  depth=",cur_recDepth,"/",cur_expRecDepth,
+            "  budget=",DoubleToString(cur_curveBudget,0),"%  toFlip=",DoubleToString(cur_distFlipAtr,1),"ATR",
+            "  recComplete=",(cur_recursiveComplete?"Y":"n"),"  failSwing=",(ctx_failureSwing?"Y":"n"));
    }
 }
 
