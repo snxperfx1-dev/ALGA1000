@@ -4983,6 +4983,183 @@ double mePDConf(const int dir)
 
 
 //==================================================================
+//  v13.3 SPEC-ALIGNMENT (formal spec.jsx v1.0)  -- all items EXCEPT daily-loss halt
+//==================================================================
+//   5.3 Liquidity quantification / hunt-the-heavier-pool   (factor)
+//   E7  Max-stop gate (oversized stop = POI not refined)   (TryEnter gate)
+//   4.1 Structural TP ladder (TP2 = external/liquidity)     (TryEnter)
+//   2.3 Daily-cycle GMT state + NY-cross timing             (factor)
+//   I7  News blackout window                                (TryEnter gate)
+//   5.1 Max total open risk (NOT daily-loss halt)           (TryEnter gate)
+//   S3  Counter-trend risk cap                              (TryEnter sizing)
+//   EP4 Revenge-trade block / FE3 consecutive-loss lock     (TryEnter gate)
+//   6.1 Trade CSV audit log                                 (TryEnter)
+//==================================================================
+input group "Letra37 EA - v13.3 Spec Alignment"
+input bool   InpUseLiquidityLots    = true;  // 5.3: liquidity quantification / hunt the heavier pool
+input double InpMaxStopAtr           = 2.5;  // E7: reject entry if stop > N ATR (POI not refined enough)
+input double InpMaxStopPips          = 0.0;  // E7: hard pip cap (0=off; set ~6 for strict spec)
+input bool   InpUseStructuralTP      = true; // 4.1: set TP2 = external-structure / liquidity target
+input bool   InpUseDailyCycleGMT     = true; // 2.3: daily-cycle GMT state + NY-cross timing confidence
+input int    InpGMTOffsetHours       = 0;    // 2.3: broker server-time offset from GMT (calibrate!)
+input bool   InpAvoidNews            = false;// I7: block entries around a news time (set per NFP day)
+input int    InpNewsHour             = 13;   // I7: news event hour (server time)
+input int    InpNewsMin              = 30;   // I7: news event minute
+input int    InpNewsBufferMin        = 30;   // I7: block window +/- minutes around the event
+input double InpMaxTotalRiskPct      = 3.0;  // 5.1: max summed open risk across positions (daily-loss halt NOT included)
+input double InpCounterTrendRiskPct  = 0.5;  // S3: risk cap (%) for counter-trend / inducement trades
+input int    InpRevengeMinutes       = 10;   // EP4: block new entries within N minutes of a closed loss
+input int    InpConsecLossLock       = 3;    // FE3: block after N consecutive losses at the same zone (0=off)
+input double InpConsecLossAtr        = 1.0;  // FE3: zone tolerance (xATR) for "same zone"
+input bool   InpTradeLog             = true; // 6.1: append entry audit rows to CSV (process record)
+input string InpTradeLogFile         = "Letra37_trades.csv"; // 6.1: CSV filename (common files folder)
+
+//------------------------- outputs --------------------------------
+string me_dailyState="-";                          // 2.3
+double me_lotsAbove=0, me_lotsBelow=0, me_estLotsTarget=0;  // 5.3
+
+double mePipSize(){ return((_Digits==3||_Digits==5)?10.0*_Point:_Point); }
+
+//==================================================================
+// 5.3  LIQUIDITY QUANTIFICATION  (heavier resting pool = expansion target)
+//==================================================================
+void meUpdateLiquidityLots()
+{
+   double px=iClose(_Symbol,_Period,1);
+   me_lotsAbove=0; me_lotsBelow=0;
+   for(int i=0;i<me_poolHiN;i++) if(me_poolHi[i]>px) me_lotsAbove+=(double)me_poolHiCnt[i];  // touch-count = resting density
+   for(int i=0;i<me_poolLoN;i++) if(me_poolLo[i]<px) me_lotsBelow+=(double)me_poolLoCnt[i];
+   double ps=mePipSize(); if(ps<=0) ps=_Point;
+   double tA=me_liqTargetAbove;
+   me_estLotsTarget=(!naf(tA))?((tA-px)/ps)*100000.0:0.0;     // spec display metric: pips x 100k
+}
+double meLiquidityLotsConf(const int dir)
+{
+   if(!InpUseLiquidityLots) return(100.0);
+   double tgtSide=(dir==1)?me_lotsAbove:me_lotsBelow;   // the pool we are heading toward
+   double oppSide=(dir==1)?me_lotsBelow:me_lotsAbove;
+   if(tgtSide<=0 && oppSide<=0) return(60.0);
+   if(tgtSide>=oppSide) return(100.0);                  // institutions hunt the larger pool first -> we are aligned
+   return(50.0);                                        // heavier pool is behind us -> reversal risk
+}
+
+//==================================================================
+// 2.3  DAILY-CYCLE GMT STATE MACHINE
+//==================================================================
+void meUpdateDailyStateGMT()
+{
+   MqlDateTime t; TimeToStruct(TimeCurrent(),t);
+   int g=(t.hour - InpGMTOffsetHours + 48)%24;          // server -> GMT
+   string s;
+   if(g>=23)      s="SYDNEY_RANGE";
+   else if(g<1)   s="ALGORITHM_RAID";
+   else if(g<5)   s="ASIA_RANGE";
+   else if(g<7)   s="FRANKFURT_RAID";
+   else if(g<12)  s="LONDON_OPEN";
+   else if(g<13)  s="NY_CROSS";
+   else if(g<17)  s="EXPANSION";
+   else if(g<21)  s="LATE_SESSION";
+   else           s="DAILY_CLOSE";
+   me_dailyState=s;
+}
+double meDailyStateConf(const int dir)
+{
+   if(!InpUseDailyCycleGMT) return(100.0);
+   if(me_dailyState=="NY_CROSS" || me_dailyState=="EXPANSION") return((dir==me_dailyBias)?100.0:80.0);
+   if(me_dailyState=="LATE_SESSION")  return(75.0);
+   if(me_dailyState=="LONDON_OPEN")   return(65.0);
+   if(me_dailyState=="FRANKFURT_RAID")return(60.0);
+   if(me_dailyState=="DAILY_CLOSE")   return(55.0);
+   return(45.0);   // SYDNEY_RANGE / ALGORITHM_RAID / ASIA_RANGE -- pre-liquidation
+}
+
+//==================================================================
+// 5.1  OPEN-RISK SUM (this EA's positions on this symbol)
+//==================================================================
+double meOpenRiskPct()
+{
+   double tot=0.0, eq=MathMax(gAccount.Equity(),1.0), mpp=MoneyPerPointPerLot();
+   for(int q=PositionsTotal()-1;q>=0;q--){
+      ulong tk=PositionGetTicket(q); if(tk==0) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      double op=PositionGetDouble(POSITION_PRICE_OPEN), sl=PositionGetDouble(POSITION_SL), vol=PositionGetDouble(POSITION_VOLUME);
+      if(sl<=0) continue;
+      tot += (MathAbs(op-sl)/_Point)*mpp*vol;
+   }
+   return(tot/eq*100.0);
+}
+
+//==================================================================
+// EP4 / FE3  REVENGE + CONSECUTIVE-LOSS HISTORY GUARD
+//==================================================================
+bool meEntryHistoryOK(const int dir)
+{
+   if(!HistorySelect(TimeCurrent()-7*86400, TimeCurrent())) return(true);
+   int td=HistoryDealsTotal();
+   bool haveLast=false; double lastProfit=0; datetime lastClose=0;
+   int lossStreak=0; double zonePrice=0; bool zoneSet=false;
+   double atr=cur_atr>0?cur_atr:10*_Point;
+   for(int i=td-1; i>=0 && i>=td-60; i--){
+      ulong dl=HistoryDealGetTicket(i); if(dl==0) continue;
+      if(HistoryDealGetInteger(dl,DEAL_MAGIC)!=(long)InpMagic) continue;
+      if(HistoryDealGetString(dl,DEAL_SYMBOL)!=_Symbol) continue;
+      if(HistoryDealGetInteger(dl,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+      double pr=HistoryDealGetDouble(dl,DEAL_PROFIT)+HistoryDealGetDouble(dl,DEAL_SWAP)+HistoryDealGetDouble(dl,DEAL_COMMISSION);
+      datetime tt=(datetime)HistoryDealGetInteger(dl,DEAL_TIME);
+      double price=HistoryDealGetDouble(dl,DEAL_PRICE);
+      if(!haveLast){ haveLast=true; lastProfit=pr; lastClose=tt; }
+      if(pr<0){
+         if(!zoneSet){ zonePrice=price; zoneSet=true; lossStreak=1; }
+         else if(MathAbs(price-zonePrice)<=atr*InpConsecLossAtr) lossStreak++;
+         else break;
+      } else break;   // a win/BE breaks the streak
+   }
+   if(InpRevengeMinutes>0 && haveLast && lastProfit<0 && (TimeCurrent()-lastClose)<(InpRevengeMinutes*60)){
+      gEntryBlock="revenge guard: loss "+IntegerToString((int)((TimeCurrent()-lastClose)/60))+"m ago (<"+IntegerToString(InpRevengeMinutes)+"m)";
+      return(false);
+   }
+   if(InpConsecLossLock>0 && lossStreak>=InpConsecLossLock){
+      gEntryBlock="consecutive-loss lock: "+IntegerToString(lossStreak)+" losses at same zone";
+      return(false);
+   }
+   return(true);
+}
+
+//==================================================================
+// 4.1  STRUCTURAL TP (TP2 = next external structure / liquidity target)
+//==================================================================
+double meStructuralTP(const int dir,const double entry)
+{
+   double tgt=(dir==1)?me_liqTargetAbove:me_liqTargetBelow;
+   if(!naf(tgt) && ((dir==1 && tgt>entry) || (dir==-1 && tgt<entry))) return(tgt);
+   ENUM_TIMEFRAMES tf=_Period;
+   for(int s=3;s<=120;s++){
+      if(dir==1  && meIsSwingHigh(tf,s,2)){ double h=iHigh(_Symbol,tf,s); if(h>entry) return(h); }
+      if(dir==-1 && meIsSwingLow(tf,s,2)){  double l=iLow(_Symbol,tf,s);  if(l>0 && l<entry) return(l); }
+   }
+   return(NA);
+}
+
+//==================================================================
+// 6.1  TRADE CSV AUDIT LOG (entry process record)
+//==================================================================
+void meLogTrade(const int dir,const double entry,const double sl,const double tp,const double lot,const double execP,const string typ,const string why)
+{
+   double ps=mePipSize(); if(ps<=0) ps=_Point;
+   int h=FileOpen(InpTradeLogFile, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ',');
+   if(h==INVALID_HANDLE) return;
+   FileSeek(h,0,SEEK_END);
+   FileWrite(h,
+      TimeToString(TimeCurrent(),TIME_DATE|TIME_MINUTES), _Symbol, (dir==1?"LONG":"SHORT"),
+      DoubleToString(lot,2), DoubleToString(entry,_Digits), DoubleToString(sl,_Digits),
+      DoubleToString(MathAbs(entry-sl)/ps,1), DoubleToString(tp,_Digits),
+      DoubleToString(execP,0), typ, me_phaseLabel, me_dailyState, cur_curveOwner,
+      DoubleToString(cur_mtfEntryDom,0), why);
+   FileClose(h);
+}
+
+
+//==================================================================
 void UpdateMethodologyEngines()
 {
    if(InpUseTimeEngine || InpUseLiquidityEngine) meUpdateDailyCycle();   // Asia range feeds E1
@@ -4998,6 +5175,8 @@ void UpdateMethodologyEngines()
    if(InpUseExhaustion)      meUpdateDrives();
    if(InpUseQM)              meUpdateQM();
    if(InpUsePremiumDiscount) meUpdatePD();
+   if(InpUseLiquidityLots)   meUpdateLiquidityLots();
+   if(InpUseDailyCycleGMT)   meUpdateDailyStateGMT();
    meUpdatePhase();                                                      // output label, always
 }
 
@@ -5070,6 +5249,9 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    if(InpUseExhaustion)      exhC=meExhaustionConf(dir);
    if(InpUseQM)              qmC =meQMConf(dir);
    if(InpUsePremiumDiscount) pdC =mePDConf(dir);
+   double lotsC=100,dsC=100;   // v13.3
+   if(InpUseLiquidityLots)   lotsC=meLiquidityLotsConf(dir);
+   if(InpUseDailyCycleGMT)   dsC  =meDailyStateConf(dir);
    if(InpUseRoundLevels)     rndC=meRoundConf(dir);
    if(InpUseTimingWindows)   twC =meTimingWindowConf(dir);
    if(InpUseLiquidityEngine) densC=meTargetDensityConf(dir);
@@ -5098,6 +5280,8 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    if(InpUseExhaustion)      meAddF(exhC,logsum,cnt);
    if(InpUseQM)              meAddF(qmC,logsum,cnt);
    if(InpUsePremiumDiscount) meAddF(pdC,logsum,cnt);
+   if(InpUseLiquidityLots)   meAddF(lotsC,logsum,cnt);
+   if(InpUseDailyCycleGMT)   meAddF(dsC,logsum,cnt);
 
    execProb=(cnt>0)?100.0*MathExp(logsum/(double)cnt):0.0;
 
@@ -5108,7 +5292,8 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
                " cyc"+IntegerToString((int)cycC)+" brk"+IntegerToString((int)brkC)+
                " x"+IntegerToString((int)xC)+" prc"+IntegerToString((int)prcC)+
                " rnd"+IntegerToString((int)rndC)+" tw"+IntegerToString((int)twC)+" den"+IntegerToString((int)densC)+
-               " wyc"+IntegerToString((int)wycC)+" exh"+IntegerToString((int)exhC)+" qm"+IntegerToString((int)qmC)+" pd"+IntegerToString((int)pdC)+"]";
+               " wyc"+IntegerToString((int)wycC)+" exh"+IntegerToString((int)exhC)+" qm"+IntegerToString((int)qmC)+" pd"+IntegerToString((int)pdC)+
+               " lot"+IntegerToString((int)lotsC)+" ds"+IntegerToString((int)dsC)+"]";
    if(execProb<InpExecProbMin){
       reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+diag; return(false);
    }
@@ -5170,6 +5355,14 @@ void TryEnter()
    if(CountOwnPositions()>=InpMaxPositions){ gEntryBlock="max positions"; return; }
    if(gMktClosed){ gEntryBlock="market closed (flip-close rejected)"; return; }
    if(InpVerifyTradeAllowed && !TradingEnabled()){ gEntryBlock="algo-trading disabled"; return; }
+   //--- v13.3 NEWS BLACKOUT (I7) ---
+   if(InpAvoidNews){
+      MqlDateTime _nw; TimeToStruct(TimeCurrent(),_nw);
+      int _nowM=_nw.hour*60+_nw.min, _evM=InpNewsHour*60+InpNewsMin;
+      if(MathAbs(_nowM-_evM)<=InpNewsBufferMin){ gEntryBlock="news blackout window"; return; }
+   }
+   //--- v13.3 REVENGE (EP4) / CONSECUTIVE-LOSS (FE3) guards ---
+   if(!meEntryHistoryOK(dir)) return;   // gEntryBlock set inside
 
    sym.RefreshRates();
    double ask=sym.Ask(), bid=sym.Bid();
@@ -5190,12 +5383,38 @@ void TryEnter()
          if(dir==-1 && _slC>entry && _slC<slBase) slBase=_slC;
       }
    }
+   //--- v13.3 MAX-STOP gate (E7): oversized stop = POI not refined enough = do not enter ---
+   {
+      double _atrS=cur_atr>0?cur_atr:10*_Point;
+      double _slA=MathAbs(entry-slBase)/_atrS;
+      if(InpMaxStopAtr>0.0 && _slA>InpMaxStopAtr){ gEntryBlock="stop too wide "+DoubleToString(_slA,1)+"ATR > "+DoubleToString(InpMaxStopAtr,1)+" (POI not refined)"; return; }
+      double _ps2=mePipSize();
+      if(InpMaxStopPips>0.0 && _ps2>0 && (MathAbs(entry-slBase)/_ps2)>InpMaxStopPips){ gEntryBlock="stop too wide (>"+DoubleToString(InpMaxStopPips,0)+" pips)"; return; }
+   }
    double lot=CalcLot(entry,slBase);
+   //--- v13.3 COUNTER-TREND risk cap (S3): shrink size for counter-trend / inducement trades ---
+   if(InpCounterTrendRiskPct>0.0 && me_externalDir!=0 && dir!=me_externalDir){
+      double _rm=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
+      double _rp=_rm/MathMax(gAccount.Equity(),1.0)*100.0;
+      if(_rp>InpCounterTrendRiskPct && _rp>0.0){ lot=NormalizeLot(lot*(InpCounterTrendRiskPct/_rp)); }
+   }
+   //--- v13.3 MAX TOTAL OPEN RISK (5.1) -- daily-loss halt intentionally NOT included ---
+   if(InpMaxTotalRiskPct>0.0){
+      double _nrm=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
+      double _nrp=_nrm/MathMax(gAccount.Equity(),1.0)*100.0;
+      double _orp=meOpenRiskPct();
+      if(_orp+_nrp>InpMaxTotalRiskPct){ gEntryBlock="max total open risk "+DoubleToString(_orp+_nrp,1)+"% > "+DoubleToString(InpMaxTotalRiskPct,1)+"%"; return; }
+   }
    double tp=ComputeTP(dir,entry,slBase);                        // 0 -> owner-driven exits manage the trade
    //--- mgmt: counter-trend Asia trades get a hard TP cap (Asia range is small; you may be asleep) ---
    if(InpCounterTrendAsiaTP>0.0 && me_inAsiaNow && me_externalDir!=0 && dir!=me_externalDir){
       double _ctp=(dir==1)?entry+InpCounterTrendAsiaTP:entry-InpCounterTrendAsiaTP;
       if(tp<=0.0 || (dir==1 && _ctp<tp) || (dir==-1 && _ctp>tp)) tp=_ctp;
+   }
+   //--- v13.3 STRUCTURAL TP LADDER (4.1): give the runner a defined external/liquidity target ---
+   if(InpUseStructuralTP && tp<=0.0){
+      double _tp2=meStructuralTP(dir,entry);
+      if(!naf(_tp2) && ((dir==1 && _tp2>entry) || (dir==-1 && _tp2<entry))) tp=_tp2;
    }
    if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
    if(InpSmallAccount && InpSmallAcctMaxRiskPct>0.0){
@@ -5234,6 +5453,7 @@ void TryEnter()
    gTradesToday++;
    gEntryBlock="ENTERED SPEC "+_typeTx;
    MgRegister(trade.ResultOrder(),slBase,NA,dir,true,_tradeType);
+   if(InpTradeLog) meLogTrade(dir,entry,slBase,tp,lot,execProb,_typeTx,why);  // 6.1 audit record
    if(InpDebugEntries){
       double _risk=MathAbs(entry-slBase);
       Print("=== ENTRY SPEC ",(dir==1?"BUY":"SELL")," ",_typeTx,
