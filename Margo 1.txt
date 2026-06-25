@@ -5160,6 +5160,112 @@ void meLogTrade(const int dir,const double entry,const double sl,const double tp
 
 
 //==================================================================
+//  v13.4 MASTER-SPEC ALIGNMENT  (additive; daily-loss halt still excluded)
+//==================================================================
+//   §20 FU candle detector (explicit entry trigger)
+//   §14 Sydney/London session H/L + day-type-from-raid + TLD/THD
+//   §12 Weekly -5% loss -> halve sizing (NOT daily-loss halt)
+//   §20 Auto GMT offset option
+//==================================================================
+input group "Letra37 EA - v13.4 Master-Spec"
+input bool   InpUseFUCandle       = true;   // §20: explicit FU candle (wick through precision + opposing close)
+input double InpFUWickFrac        = 0.35;   // §20: min wick fraction beyond the precision level
+input bool   InpRequireFU         = false;  // §E4: HARD-require a FU candle to enter (else soft factor)
+input bool   InpUseSessionDayType = true;   // §14: derive day-type/bias from the Sydney-range raid
+input bool   InpAutoGMT           = false;  // §20: use TimeGMT() instead of InpGMTOffsetHours
+input double InpWeeklyLossHalvePct= 5.0;    // §12: weekly loss %% that halves sizing (0=off)
+
+//------------------------- outputs --------------------------------
+double me_sydHigh=DBL_MAX, me_sydLow=DBL_MAX, me_lonHigh=DBL_MAX, me_lonLow=DBL_MAX;  // §14
+double me_tld=DBL_MAX, me_thd=DBL_MAX; bool me_tldPrinted=false, me_thdPrinted=false;
+int    me_dayTypeRaid=0;
+
+int meGMTHour()
+{
+   MqlDateTime t;
+   if(InpAutoGMT){ TimeToStruct(TimeGMT(),t); return(t.hour); }
+   TimeToStruct(TimeCurrent(),t); return((t.hour - InpGMTOffsetHours + 48)%24);
+}
+
+//==================================================================
+// §14  SESSION H/L + DAY-TYPE + TLD/THD
+//==================================================================
+void meUpdateSessions()
+{
+   ENUM_TIMEFRAMES tf=PERIOD_M15;
+   double sH=-DBL_MAX,sL=DBL_MAX,lH=-DBL_MAX,lL=DBL_MAX; bool sAny=false,lAny=false;
+   datetime gmtShift=(InpAutoGMT)?(TimeCurrent()-TimeGMT()):0;
+   for(int s=1;s<=96;s++){
+      datetime bt=iTime(_Symbol,tf,s); if(bt<=0) break;
+      MqlDateTime d; int g;
+      if(InpAutoGMT){ TimeToStruct(bt-gmtShift,d); g=d.hour; }
+      else { TimeToStruct(bt,d); g=(d.hour - InpGMTOffsetHours + 48)%24; }
+      double H=iHigh(_Symbol,tf,s),L=iLow(_Symbol,tf,s); if(L<=0) continue;
+      if(g>=23 || g<1){ if(H>sH)sH=H; if(L<sL)sL=L; sAny=true; }   // Sydney 23:00-01:00 GMT
+      if(g>=7 && g<12){ if(H>lH)lH=H; if(L<lL)lL=L; lAny=true; }   // London 07:00-12:00 GMT
+   }
+   if(sAny){ me_sydHigh=sH; me_sydLow=sL; } else { me_sydHigh=NA; me_sydLow=NA; }
+   if(lAny){ me_lonHigh=lH; me_lonLow=lL; } else { me_lonHigh=NA; me_lonLow=NA; }
+
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   me_dayTypeRaid=0;
+   if(sAny && !naf(me_sydLow) && !naf(me_sydHigh)){
+      if(bid<me_sydLow)      me_dayTypeRaid=1;    // Sydney LOW raided  -> bullish day
+      else if(bid>me_sydHigh) me_dayTypeRaid=-1;  // Sydney HIGH raided -> bearish day
+   }
+   if(InpUseSessionDayType && me_dayTypeRaid!=0) me_dailyBias=me_dayTypeRaid;
+
+   int g=meGMTHour();
+   if(g>=12 && g<13){                              // NY-cross: print True Low/High of Day
+      if(me_dailyBias>0 && (naf(me_tld)||bid<me_tld)){ me_tld=bid; me_tldPrinted=true; }
+      if(me_dailyBias<0 && (naf(me_thd)||bid>me_thd)){ me_thd=bid; me_thdPrinted=true; }
+   }
+}
+
+//==================================================================
+// §20  FU CANDLE DETECTOR  (wick through precision level + opposing close)
+//==================================================================
+bool meFUCandle(const int dir)
+{
+   ENUM_TIMEFRAMES tf=_Period;
+   double lvl=(dir==1)?me_lastSweptLow:me_lastSweptHigh;
+   if(naf(lvl)) return(false);
+   for(int s=1;s<=6;s++){
+      double o=iOpen(_Symbol,tf,s),h=iHigh(_Symbol,tf,s),l=iLow(_Symbol,tf,s),c=iClose(_Symbol,tf,s);
+      if(o<=0) continue;
+      double rng=fmax2(h-l,1e-9);
+      if(dir==1  && l<lvl && c>lvl && c>o && (lvl-l)/rng>=InpFUWickFrac) return(true);  // wick below precision, close back above
+      if(dir==-1 && h>lvl && c<lvl && c<o && (h-lvl)/rng>=InpFUWickFrac) return(true);
+   }
+   return(false);
+}
+double meFUConf(const int dir)
+{
+   if(!InpUseFUCandle) return(100.0);
+   return(meFUCandle(dir)?100.0:55.0);
+}
+
+//==================================================================
+// §12  WEEKLY P&L  (for -5% -> halve sizing)
+//==================================================================
+double meWeeklyPnL()
+{
+   MqlDateTime t; TimeToStruct(TimeCurrent(),t);
+   int dow=t.day_of_week; int back=(dow==0?6:dow-1);
+   datetime weekStart=TimeCurrent()-(back*86400)-(t.hour*3600+t.min*60+t.sec);
+   if(!HistorySelect(weekStart,TimeCurrent())) return(0.0);
+   double pnl=0.0; int td=HistoryDealsTotal();
+   for(int i=0;i<td;i++){
+      ulong dl=HistoryDealGetTicket(i); if(dl==0) continue;
+      if(HistoryDealGetInteger(dl,DEAL_MAGIC)!=(long)InpMagic) continue;
+      if(HistoryDealGetString(dl,DEAL_SYMBOL)!=_Symbol) continue;
+      pnl += HistoryDealGetDouble(dl,DEAL_PROFIT)+HistoryDealGetDouble(dl,DEAL_SWAP)+HistoryDealGetDouble(dl,DEAL_COMMISSION);
+   }
+   return(pnl);
+}
+
+
+//==================================================================
 void UpdateMethodologyEngines()
 {
    if(InpUseTimeEngine || InpUseLiquidityEngine) meUpdateDailyCycle();   // Asia range feeds E1
@@ -5177,6 +5283,7 @@ void UpdateMethodologyEngines()
    if(InpUsePremiumDiscount) meUpdatePD();
    if(InpUseLiquidityLots)   meUpdateLiquidityLots();
    if(InpUseDailyCycleGMT)   meUpdateDailyStateGMT();
+   meUpdateSessions();
    meUpdatePhase();                                                      // output label, always
 }
 
@@ -5203,6 +5310,8 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
       reason="FIRST STRIKE on "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < "+IntegerToString((int)InpMinDomTransfer)+"%) -- building, not executing";
       return(false);
    }
+   //--- v13.4 FU candle HARD gate (optional) ---
+   if(InpUseFUCandle && InpRequireFU && !meFUCandle(dir)){ reason="no FU candle at precision level (wick-grab + opposing close)"; return(false); }
    //--- 3) Geometry: at the HTF flip terminal (curve-alive zone) ---
    bool   ctxOn  = InpUseV60Context;
    bool   atFlip = ctxOn ? ctx_atFlip : (cur_distFlipAtr<=InpSpecFlipAtr);
@@ -5249,7 +5358,8 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    if(InpUseExhaustion)      exhC=meExhaustionConf(dir);
    if(InpUseQM)              qmC =meQMConf(dir);
    if(InpUsePremiumDiscount) pdC =mePDConf(dir);
-   double lotsC=100,dsC=100;   // v13.3
+   double lotsC=100,dsC=100,fuC=100;   // v13.3 / v13.4
+   if(InpUseFUCandle)        fuC =meFUConf(dir);
    if(InpUseLiquidityLots)   lotsC=meLiquidityLotsConf(dir);
    if(InpUseDailyCycleGMT)   dsC  =meDailyStateConf(dir);
    if(InpUseRoundLevels)     rndC=meRoundConf(dir);
@@ -5282,6 +5392,7 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
    if(InpUsePremiumDiscount) meAddF(pdC,logsum,cnt);
    if(InpUseLiquidityLots)   meAddF(lotsC,logsum,cnt);
    if(InpUseDailyCycleGMT)   meAddF(dsC,logsum,cnt);
+   if(InpUseFUCandle)        meAddF(fuC,logsum,cnt);
 
    execProb=(cnt>0)?100.0*MathExp(logsum/(double)cnt):0.0;
 
@@ -5293,7 +5404,7 @@ bool SpecEntryDecision(int &dir,double &execProb,string &reason)
                " x"+IntegerToString((int)xC)+" prc"+IntegerToString((int)prcC)+
                " rnd"+IntegerToString((int)rndC)+" tw"+IntegerToString((int)twC)+" den"+IntegerToString((int)densC)+
                " wyc"+IntegerToString((int)wycC)+" exh"+IntegerToString((int)exhC)+" qm"+IntegerToString((int)qmC)+" pd"+IntegerToString((int)pdC)+
-               " lot"+IntegerToString((int)lotsC)+" ds"+IntegerToString((int)dsC)+"]";
+               " lot"+IntegerToString((int)lotsC)+" ds"+IntegerToString((int)dsC)+" fu"+IntegerToString((int)fuC)+"]";
    if(execProb<InpExecProbMin){
       reason="execProb "+IntegerToString((int)execProb)+"% < "+IntegerToString((int)InpExecProbMin)+"%"+diag; return(false);
    }
@@ -5397,6 +5508,11 @@ void TryEnter()
       double _rm=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
       double _rp=_rm/MathMax(gAccount.Equity(),1.0)*100.0;
       if(_rp>InpCounterTrendRiskPct && _rp>0.0){ lot=NormalizeLot(lot*(InpCounterTrendRiskPct/_rp)); }
+   }
+   //--- v13.4 WEEKLY-LOSS halve sizing (12) -- NOT the daily-loss halt ---
+   if(InpWeeklyLossHalvePct>0.0){
+      double _wp=meWeeklyPnL(); double _wlim=-(gAccount.Equity()*InpWeeklyLossHalvePct/100.0);
+      if(_wp<=_wlim) lot=NormalizeLot(lot*0.5);
    }
    //--- v13.3 MAX TOTAL OPEN RISK (5.1) -- daily-loss halt intentionally NOT included ---
    if(InpMaxTotalRiskPct>0.0){
